@@ -37,13 +37,6 @@ run main()
   and a flow proc is also an ordinary proc you can call from anywhere.
 * **Safe under ARC and ORC**, checked with AddressSanitizer and ThreadSanitizer.
 
-## Install
-
-```
-nimble install stagelane        # or copy src/stagelane and src/stagelane.nim into your project
-```
-Nim 2.2+, `--mm:arc` or `--mm:orc`. For speed compile with `-d:danger`.
-
 ## Where to go next
 
 | | |
@@ -53,6 +46,7 @@ Nim 2.2+, `--mm:arc` or `--mm:orc`. For speed compile with `-d:danger`.
 | [docs/recipes.md](docs/recipes.md) | worker pools, retries, rate limits, graceful shutdown |
 | [docs/internals.md](docs/internals.md) | how it works, if you are curious or contributing |
 | `examples/` | runnable programs: echo server, pipeline, thread-pool offload, a library |
+| [demos](demos/README.md) | contains 20 demo program to showcase the power of stagelane |
 
 ## Status
 
