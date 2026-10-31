@@ -46,7 +46,7 @@ run main()
 | [docs/recipes.md](docs/recipes.md) | worker pools, retries, rate limits, graceful shutdown |
 | [docs/internals.md](docs/internals.md) | how it works, if you are curious or contributing |
 | `examples/` | runnable programs: echo server, pipeline, thread-pool offload, a library |
-| [demos](demos/README.md) | contains 20 demo program to showcase the power of stagelane |
+| [demos](demos/) | contains 20 demo program to showcase the power of stagelane |
 
 ## Status
 
