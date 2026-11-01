@@ -53,21 +53,29 @@ type
     when flowThreads:
       lock*: Lock
 
+  GroupBase* = ref object of RootObj
+    ## the part of a `Scope` that tasks need to see: children report here the moment
+    ## they finish, so a failure is noticed in completion order, not spawn order
+    ev*: WaitQueue                     ## notified whenever a child finishes
+    failed*: TaskBase                  ## the first child that failed (by time)
+
   TaskBase* = ref object of Frame
     ## a task is itself the root continuation's parent: when the root finishes
-    ## it resumes the task, whose stage publishes the outcome
+    ## it resumes the task, whose stage publishes the outcome.
+    ## (small fields first: Nim keeps declaration order, so this avoids padding)
     state*: TaskState
-    err*: ref Exception
     cancelRequested*: bool
-    parked*: pointer                   ## continuation currently parked (alias, not an owner)
     parkKind*: ParkKind                ## what it waits on (for cancellation)
+    parkWrite*: bool
+    observed*: bool
+    parkFd*: int32
+    err*: ref Exception
+    parked*: pointer                   ## continuation currently parked (alias, not an owner)
     parkQ*: pointer                    ## the WaitQueue it is parked in (borrowed)
     parkRef*: pointer                  ## Timer / AnyState it waits on (borrowed)
-    parkFd*: int
-    parkWrite*: bool
     doneq*: WaitQueue                  ## continuations waiting for completion
     sched*: pointer                    ## owning scheduler
-    observed*: bool
+    grp*: GroupBase                    ## the scope this task reports to (cleared on finish)
 
 const noStep* = Hop()
 

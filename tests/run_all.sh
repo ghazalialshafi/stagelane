@@ -4,7 +4,7 @@ cd "$(dirname "$0")"
 fail=0
 for mm in arc orc; do
   for f in t_*.nim; do
-    case $f in t_leak.nim|t_gen.nim|t_loop1.nim|t_mt.nim) continue;; esac
+    case $f in t_leak.nim|t_loop1.nim|t_mt.nim) continue;; esac
     out=$(nim c --mm:$mm --hints:off --warningAsError:Deprecated --warningAsError:UnusedImport \
        --passC:-fsanitize=address --passL:-fsanitize=address \
       -d:useMalloc "$@" -r $f 2>&1)

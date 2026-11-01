@@ -5,6 +5,9 @@ export options
 
 type
   ChanClosedError* = object of CatchableError
+    ## base of both closed-channel errors: catch this to handle either
+  SendOnClosedError* = object of ChanClosedError      ## `send` after `close`
+  RecvOnClosedError* = object of ChanClosedError      ## `recv` on a closed, drained channel
 
   ChanBase* = ref object of RootObj
     cap: int                    # < 0: unbounded
@@ -36,14 +39,14 @@ template waitData*(ch: ChanBase) =
   while not ch.canRecv: park(ch.recvQueue)
 
 proc push*[T](ch: Chan[T], v: sink T) =
-  if ch.closed: raise newException(ChanClosedError, "send on closed channel")
+  if ch.closed: raise newException(SendOnClosedError, "send on closed channel")
   ch.buf.addLast v
   inc ch.count
   notifyOne(ch.recvq)
 
 proc pop*[T](ch: Chan[T]): T =
   if ch.count == 0:
-    raise newException(ChanClosedError, "receive on closed, drained channel")
+    raise newException(RecvOnClosedError, "receive on closed, drained channel")
   result = ch.buf.popFirst
   dec ch.count
   notifyOne(ch.sendq)
@@ -86,6 +89,20 @@ template recvOpt*[T](ch: Chan[T]): Option[T] =
     let flowCh = ch
     waitData(flowCh)
     if flowCh.len == 0: none(T) else: some(flowCh.pop())
+
+template eachRecv*[T](ch: Chan[T], x: untyped, body: untyped) =
+  ## receive until the channel is closed and drained -- no exception needed:
+  ##
+  ## .. code-block:: nim
+  ##   eachRecv(jobs, job):
+  ##     process(job)          # `break` / `continue` work as in any loop
+  block:
+    let flowCh = ch
+    while true:
+      waitData(flowCh)
+      if flowCh.len == 0: break
+      let x = flowCh.pop()
+      body
 
 # --- select ------------------------------------------------------------------
 

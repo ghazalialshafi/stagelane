@@ -73,6 +73,7 @@ type
     idCounter: int
     demotable: seq[string]     # env fields that may become plain locals of one stage
     exitBody: NimNode          # code that completes the proc (inlined at return sites)
+    pragmas: seq[NimNode]      # enclosing `{.pragma.}:` blocks (re-applied to every emitted statement)
 
 const
   LocalKinds = {nskVar, nskLet, nskTemp, nskForVar, nskParam, nskResult,
@@ -104,6 +105,7 @@ proc collectDecls(n: NimNode, acc: var seq[NimNode]) =
   proc add(x: NimNode, acc: var seq[NimNode]) =
     var s = x
     if s.kind == nnkPragmaExpr: s = s[0]
+    if s.kind == nnkPostfix: s = s[1]     # `x*` can never be exported from a local
     if s.kind == nnkVarTuple:
       for i in 0..<s.len-2: add(s[i], acc)
     elif s.kind == nnkSym and s notin acc: acc.add s
@@ -245,11 +247,31 @@ proc alwaysLeaves(n: NimNode): bool =
       if br.kind == nnkElse: hasElse = true
       if not alwaysLeaves(br[^1]): return false
     hasElse
+  of nnkTryStmt:
+    # leaves when a `finally` leaves, or when the body and every handler leave
+    if n[^1].kind == nnkFinally and alwaysLeaves(n[^1][0]): return true
+    if not alwaysLeaves(n[0]): return false
+    for i in 1..<n.len:
+      if n[i].kind == nnkExceptBranch and not alwaysLeaves(n[i][^1]): return false
+    true
   else: false
+
+proc untypedPragma(p: NimNode): NimNode =
+  ## a typed pragma list -> something that can be sem-checked again
+  ## (`cast(gcsafe)` is a `Cast` node after typing)
+  result = newNimNode(nnkPragma, p)
+  for x in p:
+    if x.kind == nnkCast and x.len == 2: result.add newCall(ident"cast", copyNimTree(x[1]))
+    else: result.add copyNimTree(x)
 
 proc emit(st: St, n: NimNode) =
   if st.cur.terminated or n == nil or n.kind == nnkEmpty: return
-  st.cur.body.add n
+  var e = n
+  if st.pragmas.len > 0 and n.kind notin {nnkVarSection, nnkLetSection, nnkConstSection,
+                                           nnkTypeSection, nnkCommentStmt}:
+    for i in countdown(st.pragmas.len - 1, 0):
+      e = newTree(nnkPragmaBlock, untypedPragma(st.pragmas[i]), newStmtList(e))
+  st.cur.body.add e
   if alwaysLeaves(n): st.cur.terminated = true   # whatever follows would be dead code
 
 proc stagePtr(l: Stage): NimNode = newCall(bindSym"stageFn", l.name)
@@ -661,12 +683,15 @@ proc flat(st: St, n: NimNode): NimNode =
     error("stagelane: a suspension point may not appear inside this kind of expression (" &
           $n.kind & ")", n)
 
-proc declare(st: St, s: NimNode, demote = true): NimNode =
+proc declare(st: St, s: NimNode, demote = true, typ: NimNode = nil): NimNode =
   ## lift a local into the environment (it may be demoted again after lowering
-  ## if it never crosses a stage boundary)
+  ## if it never crosses a stage boundary).  `typ` overrides the field type
+  ## (an `openArray` parameter is stored as an owning `seq`)
   for l in st.lifted:
     if l.sym == s: return l.field
-  let f = st.newField(s.strVal, rbType(st, s.getTypeInst))
+  var s = s
+  if s.kind == nnkPostfix: s = s[1]
+  let f = st.newField(s.strVal, if typ != nil: typ else: rbType(st, s.getTypeInst))
   st.lifted.add Lifted(sym: s, field: f)
   if demote: st.demotable.add $f
   result = f
@@ -799,7 +824,14 @@ proc iterName(n: NimNode): string =
   if isCall(c) and c[0].kind == nnkSym: c[0].strVal else: ""
 
 proc lowerFor(st: St, n: NimNode) =
-  let nv = n.len - 2
+  # `for (a, b) in xs` arrives as a single `VarTuple` loop variable
+  let unpack = n.len == 3 and n[0].kind == nnkVarTuple
+  var vars: seq[NimNode]
+  if unpack:
+    for i in 0..<n[0].len-1: vars.add n[0][i]
+  else:
+    for i in 0..<n.len-2: vars.add n[i]
+  let nv = vars.len
   let body = n[^1]
   let it = skipHidden(n[^2])
   let head = st.newStage(st.frames, "for")
@@ -820,8 +852,8 @@ proc lowerFor(st: St, n: NimNode) =
     okIntRange = true; lo = it[1]; hi = it[2]
   # ------------------------------------------------------------------ ranges
   if okIntRange:
-    let iv = st.access(st.declare(n[0]))
-    let hiF = st.newField("hi", rbType(st, n[0].getTypeInst))
+    let iv = st.access(st.declare(vars[0]))
+    let hiF = st.newField("hi", rbType(st, vars[0].getTypeInst))
     let e = flatOperands(st, @[lo, hi])
     st.emit newAssignment(iv, e[0])
     st.emit newAssignment(st.access(hiF), e[1])
@@ -872,14 +904,20 @@ proc lowerFor(st: St, n: NimNode) =
       proc strip(t: NimNode): NimNode =
         if t.kind == nnkVarTy: t[0] else: t
       var elemT: NimNode
-      if nv == 1: elemT = rbType(st, strip(n[0].getTypeInst))
+      if nv == 1: elemT = rbType(st, strip(vars[0].getTypeInst))
       else:
         elemT = newNimNode(nnkTupleConstr)
-        for i in 0..<nv: elemT.add rbType(st, strip(n[i].getTypeInst))
+        for i in 0..<nv: elemT.add rbType(st, strip(vars[i].getTypeInst))
       let sf = st.newField("snap", newTree(nnkBracketExpr, ident"seq", elemT))
       let tmpNames = (0..<nv).mapIt(ident("flowV" & $it))
       let fl = newNimNode(nnkForStmt)
-      for t in tmpNames: fl.add t
+      if unpack:
+        let vt = newNimNode(nnkVarTuple)
+        for t in tmpNames: vt.add t
+        vt.add newEmptyNode()
+        fl.add vt
+      else:
+        for t in tmpNames: fl.add t
       fl.add flat(st, it)
       var item: NimNode
       if nv == 1: item = tmpNames[0]
@@ -887,6 +925,7 @@ proc lowerFor(st: St, n: NimNode) =
         item = newNimNode(nnkTupleConstr)
         for t in tmpNames: item.add t
       fl.add newCall(newDotExpr(st.access(sf), ident"add"), item)
+      st.emit newCall(bindSym"reset", st.access(sf))   # a nested loop re-fills it every time
       st.emit fl
       coll = st.access(sf)
       st.emit newAssignment(idx, newLit(0))
@@ -898,21 +937,32 @@ proc lowerFor(st: St, n: NimNode) =
     var bindStmts = newStmtList()
     case mode
     of 0:
-      bindStmts.add newAssignment(st.access(st.declare(n[0])), elem)
+      if unpack and nv > 1:
+        var lhs = newNimNode(nnkPar)
+        for i in 0..<nv: lhs.add st.access(st.declare(vars[i]))
+        bindStmts.add newAssignment(lhs, elem)
+      else:
+        bindStmts.add newAssignment(st.access(st.declare(vars[0])), elem)
     of 1:
-      bindStmts.add newAssignment(st.access(st.declare(n[0])), copyNimTree(idx))
-      bindStmts.add newAssignment(st.access(st.declare(n[1])), copyNimTree(elem))
+      bindStmts.add newAssignment(st.access(st.declare(vars[0])), copyNimTree(idx))
+      bindStmts.add newAssignment(st.access(st.declare(vars[1])), copyNimTree(elem))
     of 2:
-      st.lifted.add Lifted(sym: n[0], alias: copyNimTree(elem))
+      if unpack and nv > 1:
+        # `for (a, b) in mitems(xs)`: each name aliases one field of the element in place
+        for i in 0..<nv:
+          st.lifted.add Lifted(sym: vars[i],
+            alias: newTree(nnkBracketExpr, copyNimTree(elem), newLit(i)))
+      else:
+        st.lifted.add Lifted(sym: vars[0], alias: copyNimTree(elem))
     of 3:
-      st.lifted.add Lifted(sym: n[0], field: ident"_", alias: copyNimTree(idx))
-      st.lifted.add Lifted(sym: n[1], field: ident"_", alias: copyNimTree(elem))
+      st.lifted.add Lifted(sym: vars[0], field: ident"_", alias: copyNimTree(idx))
+      st.lifted.add Lifted(sym: vars[1], field: ident"_", alias: copyNimTree(elem))
     else:
       if nv == 1:
-        bindStmts.add newAssignment(st.access(st.declare(n[0])), elem)
+        bindStmts.add newAssignment(st.access(st.declare(vars[0])), elem)
       else:
         var lhs = newNimNode(nnkPar)
-        for i in 0..<nv: lhs.add st.access(st.declare(n[i]))
+        for i in 0..<nv: lhs.add st.access(st.declare(vars[i]))
         bindStmts.add newAssignment(lhs, elem)
     st.emit newTree(nnkIfStmt,
       newTree(nnkElifBranch, cond, newStmtList(bindStmts,
@@ -1207,7 +1257,11 @@ proc lower(st: St, n: NimNode, dest: NimNode) =
   of nnkForStmt: lowerFor(st, n)
   of nnkBlockStmt, nnkBlockExpr: lowerBlock(st, n, dest)
   of nnkTryStmt: lowerTry(st, n, dest)
-  of nnkPragmaBlock: lower(st, n[^1], dest)
+  of nnkPragmaBlock:
+    # keep the block's pragmas in force for everything emitted from inside it
+    st.pragmas.add n[0]
+    lower(st, n[^1], dest)
+    discard st.pragmas.pop
   of nnkReturnStmt:
     if n[0].kind != nnkEmpty:
       lower(st, n[0], nil)
@@ -1340,10 +1394,18 @@ proc demoteFields(st: St) =
     echo st.procName, ": env fields ", st.fields.len, " -> ", keep.len
   st.fields = keep
 
-macro flowTransform*(tType: typedesc, ctorName: untyped, ctorParams: untyped,
-                     directName: untyped, directParams: untyped, heap: static bool,
-                     procDef: typed): untyped =
+proc transformImpl(tType, ctorName, ctorParams, directName, directParams,
+                   directPragmaList: NimNode, heap: bool, procDef: NimNode,
+                   generic: bool): NimNode =
   ## see module docs.  `procDef` is the type-checked body of a flow proc.
+  ## `generic`: we are expanding *inside* the constructor of a generic flow proc
+  ## (once per instantiation, `procDef` is already concrete): the environment type
+  ## and the stages become local to that constructor, which ends with the
+  ## environment object itself.
+  var directPragma = newEmptyNode()
+  if directPragmaList.kind == nnkBracket:
+    directPragma = newTree(nnkPragma)
+    for p in directPragmaList: directPragma.add p
   var pd = procDef
   if pd.kind == nnkStmtList: pd = pd[0]
   if pd.kind != nnkProcDef:
@@ -1351,10 +1413,12 @@ macro flowTransform*(tType: typedesc, ctorName: untyped, ctorParams: untyped,
   let params = pd[3]
   let procName = $pd[0]
   # --- can this proc ever suspend?  (optimistic about itself: recursion) ---
-  analysing[$ctorName] = not heap
-  let isPure = (not heap) and not hasSusp(pd[6])
-  analysing.del($ctorName)
-  purityTable[$ctorName] = isPure
+  var isPure = false
+  if not generic:       # generic flow procs always suspend-capable (see flowImpl)
+    analysing[$ctorName] = not heap
+    isPure = (not heap) and not hasSusp(pd[6])
+    analysing.del($ctorName)
+    purityTable[$ctorName] = isPure
   let st = St(tType: tType, cId: ident"flowC", pId: ident"flowP", procName: procName)
   collectDecls(pd, st.declared)
   if pd.len > 7 and pd[7].kind == nnkSym and pd[7].symKind == nskResult: st.resultSym = pd[7]
@@ -1368,22 +1432,54 @@ macro flowTransform*(tType: typedesc, ctorName: untyped, ctorParams: untyped,
     st.resultField = ident("flowResult")
     st.fields.add (st.resultField, st.resType)
   # --- parameters become fields ---
-  var ctorFields: seq[(NimNode, NimNode)]   # field, prepare param ident
+  var ctorFields: seq[(NimNode, NimNode)]   # field, value the constructor stores
+  var refParam = ""     # a `var` parameter: only proc bodies that never suspend can have one
   for i in 1..<params.len:
     let d = params[i]
+    let tk = d[^2].typeKind
     for j in 0..<d.len-2:
       let s = d[j]
-      if d[^2].typeKind in {ntyVar, ntyOpenArray, ntyVarargs}:
-        error("stagelane: `var` / openArray parameters are not supported in flow procs " &
-              "(wrap the data in a ref object)", d)
-      let f = st.declare(s, demote = false)   # initialised by the constructor
-      ctorFields.add (f, ident(s.strVal))
+      case tk
+      of ntyVar:
+        refParam = s.strVal
+      of ntyOpenArray, ntyVarargs:
+        # copy-in: the environment owns a snapshot of the elements
+        let t = s.getTypeInst
+        if t.kind != nnkBracketExpr or t.len != 2:
+          error("stagelane: cannot determine the element type of `" & s.strVal & "`", d)
+        let f = st.declare(s, demote = false, typ = newTree(nnkBracketExpr, ident"seq", rbType(st, t[1])))
+        ctorFields.add (f, newTree(nnkPrefix, ident"@", ident(s.strVal)))
+      of ntyTypeDesc, ntyStatic:
+        discard   # compile-time metadata: nothing to store, nothing to restore
+      else:
+        let f = st.declare(s, demote = false)   # initialised by the constructor
+        ctorFields.add (f, ident(s.strVal))
+  if refParam.len > 0:
+    if not isPure:
+      error("stagelane: parameter `" & refParam & "` is `var`, which cannot live in a " &
+            "suspendable frame; a flow proc that never suspends may take `var` parameters, " &
+            "otherwise pass a `ref` (or copy in / copy out through a result)", params)
+    # A pure proc is plain native code; there is no environment to build.  It can
+    # be called (also from other flow procs) but not spawned.
+    let ds = St(direct: true, procName: procName, cId: ident"flowC", pId: ident"flowP")
+    collectDecls(pd, ds.declared)
+    for i in 1..<params.len:
+      for j in 0..<params[i].len-2:
+        ds.locals.add (params[i][j], ident(params[i][j].strVal))
+    result = newStmtList()
+    result.add newTree(nnkProcDef, directName, newEmptyNode(), newEmptyNode(),
+      directParams, directPragma, newEmptyNode(), newStmtList(rb(ds, pd[6])))
+    result.add newTree(nnkProcDef, ctorName, newEmptyNode(), newEmptyNode(),
+      ctorParams, newEmptyNode(), newEmptyNode(), newStmtList(newTree(nnkRaiseStmt,
+        newCall(ident"newException", ident"Defect", newLit("stagelane: `" & procName &
+          "` has `var` parameters and cannot be spawned; call it directly")))))
+    return copyNimTree(result)
   # --- stages ---
   st.exitStage = Stage(id: 1_000_000, name: ident(fresh(procName & "_exit")),
                    body: newStmtList(), frames: @[])
   st.stages.add st.exitStage
   # the code that completes this proc (inlined at every return site)
-  let poolable = $tType == "Frame"       # we know every field of the default base
+  let poolable = (not generic) and $tType == "Frame"   # we know every field of the default base
   let poolHead = ident(fresh("flowPoolHead"))
   let poolLen = ident(fresh("flowPoolLen"))
   let recycle = ident(fresh("flowRecycle"))
@@ -1449,6 +1545,13 @@ macro flowTransform*(tType: typedesc, ctorName: untyped, ctorParams: untyped,
     result.add stageProc(st, l, st.envName, true)
   for l in st.stages:
     result.add stageProc(st, l, st.envName, false)
+  if generic:
+    var ctor = newTree(nnkObjConstr, st.envName,
+      newTree(nnkExprColonExpr, ident"fn", stagePtr(first)))
+    for (f, p) in ctorFields:
+      ctor.add newTree(nnkExprColonExpr, f, p)
+    result.add ctor     # the value of the constructor body
+    return copyNimTree(result)
   # direct version: native code for pure procs, a synchronous driver otherwise
   block:
     let dparams = directParams
@@ -1468,7 +1571,7 @@ macro flowTransform*(tType: typedesc, ctorName: untyped, ctorParams: untyped,
       else: dbody.add newAssignment(ident"result",
         newCall(bindSym"blockOn", call, copyNimTree(directParams[0])))
     result.add newTree(nnkProcDef, directName, newEmptyNode(), newEmptyNode(),
-      dparams, newEmptyNode(), newEmptyNode(), dbody)
+      dparams, directPragma, newEmptyNode(), dbody)
   # prepare (reuses a pooled environment when one is available)
   let envT = st.envName
   var inits = newStmtList()
@@ -1547,15 +1650,35 @@ macro flowTransform*(tType: typedesc, ctorName: untyped, ctorParams: untyped,
   when defined(flowDebug):
     echo result.repr
 
+macro flowTransform*(tType: typedesc, ctorName: untyped, ctorParams: untyped,
+                     directName: untyped, directParams: untyped, directPragmaList: untyped,
+                     heap: static bool, procDef: typed): untyped =
+  transformImpl(tType, ctorName, ctorParams, directName, directParams,
+                directPragmaList, heap, procDef, false)
+
+macro flowTransformG*(tType: typedesc, procDef: typed): untyped =
+  ## the body of the constructor of a generic flow proc
+  transformImpl(tType, newEmptyNode(), newEmptyNode(), newEmptyNode(), newEmptyNode(),
+                newEmptyNode(), false, procDef, true)
+
 # ---------------------------------------------------------------------------
 # the user facing pragma
 # ---------------------------------------------------------------------------
 
+proc isCtParam(t: NimNode): bool =
+  ## `typedesc[T]` / `static int`: compile-time parameters make a proc generic
+  var h = t
+  if h.kind in {nnkBracketExpr, nnkCommand, nnkCall} and h.len > 0: h = h[0]
+  h.kind in {nnkIdent, nnkSym} and h.strVal.nimIdentNormalize in ["typedesc", "static"]
+
+proc mentionsIdent(n: NimNode, nm: string): bool =
+  if n.kind in {nnkIdent, nnkSym}: return n.eqIdent(nm)
+  for ch in n:
+    if mentionsIdent(ch, nm): return true
+
 proc flowImpl(tType, n: NimNode): NimNode =
   if n.kind notin {nnkProcDef, nnkFuncDef}:
     error("{.flow.} can only be applied to procs", n)
-  if n[2].kind != nnkEmpty:
-    error("stagelane: generic flow procs are not supported yet", n[2])
   let nameNode = n[0]
   var plain = nameNode
   if plain.kind == nnkPostfix: plain = plain[1]
@@ -1564,13 +1687,38 @@ proc flowImpl(tType, n: NimNode): NimNode =
   let wname = ident(fresh("flowW_" & cleanName(nm)))
   # prepare: same parameters, returns the continuation base type
   let fp = n[3].copyNimTree
+  # a parameter called `_` cannot be forwarded: give it a real name
+  var anon = 0
+  for i in 1..<fp.len:
+    for j in 0..<fp[i].len-2:
+      if fp[i][j].kind == nnkIdent and fp[i][j].eqIdent("_"):
+        fp[i][j] = ident("flowAnon" & $anon)
+        inc anon
+  var generic = n[2].kind != nnkEmpty
+  for i in 1..<fp.len:
+    if isCtParam(fp[i][^2]): generic = true      # typedesc / static: implicitly generic
   let wparams = newTree(nnkFormalParams, tType)
   for i in 1..<fp.len: wparams.add fp[i].copyNimTree
-  let fwd = newTree(nnkProcDef, wname, newEmptyNode(), newEmptyNode(),
+  let gparams = if generic: n[2].copyNimTree else: newEmptyNode()
+  let fwd = newTree(nnkProcDef, wname, newEmptyNode(), gparams.copyNimTree,
     wparams.copyNimTree, newEmptyNode(), newEmptyNode(), newEmptyNode())
   let dname = ident(fresh("flowD_" & cleanName(nm)))
-  let dfwd = newTree(nnkProcDef, dname, newEmptyNode(), newEmptyNode(),
-    fp.copyNimTree, newEmptyNode(), newEmptyNode(), newEmptyNode())
+  # calling-convention / inlining pragmas belong to the direct proc too; the
+  # `nimcall` stages keep their own signature
+  var dprag = newEmptyNode()
+  if n[4].kind == nnkPragma:
+    for p in n[4]:
+      let pn = if p.kind == nnkExprColonExpr: p[0] else: p
+      if pn.kind == nnkIdent and pn.strVal.nimIdentNormalize in
+         ["inline", "noinline", "cdecl", "stdcall", "fastcall", "thiscall", "safecall", "syscall"]:
+        if dprag.kind == nnkEmpty: dprag = newTree(nnkBracket)
+        dprag.add p.copyNimTree
+  var dprList = newEmptyNode()      # the same list as a real pragma node
+  if dprag.kind == nnkBracket:
+    dprList = newTree(nnkPragma)
+    for p in dprag: dprList.add p.copyNimTree
+  let dfwd = newTree(nnkProcDef, dname, newEmptyNode(), gparams.copyNimTree,
+    fp.copyNimTree, dprList, newEmptyNode(), newEmptyNode())
   var heap = false
   # stub
   let stub = n.copyNimTree
@@ -1583,6 +1731,7 @@ proc flowImpl(tType, n: NimNode): NimNode =
   prag.add newTree(nnkExprColonExpr, bindSym"flowCtor", wname)
   prag.add newTree(nnkExprColonExpr, bindSym"flowDirect", dname)
   stub[4] = prag
+  stub[3] = fp.copyNimTree
   let retT = fp[0]
   let isVoid = retT.kind == nnkEmpty or (retT.kind == nnkIdent and retT.eqIdent("void"))
   let call = newCall(dname)
@@ -1590,6 +1739,41 @@ proc flowImpl(tType, n: NimNode): NimNode =
     for j in 0..<fp[i].len-2: call.add ident($fp[i][j])
   if isVoid: stub[6] = newStmtList(call)
   else: stub[6] = newStmtList(newAssignment(ident"result", call))
+  if generic:
+    # Every explicit generic parameter must be deducible from the arguments: callers
+    # reach the constructor through the stub's instantiated symbol only.
+    if n[2].kind != nnkEmpty:
+      for g in n[2]:
+        for j in 0..<g.len-2:
+          var seen = false
+          for i in 1..<fp.len:
+            if mentionsIdent(fp[i][^2], $g[j]): seen = true
+          if not seen:
+            error("stagelane: generic parameter `" & $g[j] & "` of a flow proc must appear in " &
+                  "a parameter type (add `_: typedesc[" & $g[j] & "]`)", g)
+    # a generic proc is never "pure": the constructor must always be reachable
+    purityTable[$wname] = false
+    # The constructor is generic; each instantiation expands `flowTransformG` on a
+    # nested, fully typed copy of the body (runtime parameters only -- typedesc /
+    # static parameters stay visible from the constructor's own scope).
+    let nested = newTree(nnkProcDef, ident(nm & "_flowBody"), newEmptyNode(), newEmptyNode(),
+      newTree(nnkFormalParams, fp[0].copyNimTree), newEmptyNode(), newEmptyNode(),
+      n[6].copyNimTree)
+    for i in 1..<fp.len:
+      if not isCtParam(fp[i][^2]): nested[3].add fp[i].copyNimTree
+    let ctorDef = newTree(nnkProcDef, wname, newEmptyNode(), gparams.copyNimTree,
+      wparams.copyNimTree, newEmptyNode(), newEmptyNode(),
+      newStmtList(newCall(bindSym"flowTransformG", tType, nested)))
+    let dcall = newCall(wname)
+    for i in 1..<fp.len:
+      for j in 0..<fp[i].len-2: dcall.add ident($fp[i][j])
+    let dbody =
+      if isVoid: newStmtList(newCall(bindSym"blockOn", dcall))
+      else: newStmtList(newAssignment(ident"result",
+              newCall(bindSym"blockOn", dcall, copyNimTree(fp[0]))))
+    let dDef = newTree(nnkProcDef, dname, newEmptyNode(), gparams.copyNimTree,
+      fp.copyNimTree, dprList.copyNimTree, newEmptyNode(), dbody)
+    return newStmtList(fwd, dfwd, stub, ctorDef, dDef)
   # body proc, checked under another name
   let bodyProc = n.copyNimTree
   bodyProc[0] = ident(nm & "_flowBody")
@@ -1597,7 +1781,7 @@ proc flowImpl(tType, n: NimNode): NimNode =
   # the pragma macro already stripped; keep other pragmas out of the body
   result = newStmtList(fwd, dfwd, stub,
     newCall(bindSym"flowTransform", tType, wname, wparams.copyNimTree, dname,
-            fp.copyNimTree, newLit(heap), bodyProc))
+            fp.copyNimTree, dprag.copyNimTree, newLit(heap), bodyProc))
 
 macro flow*(tType: untyped, n: untyped): untyped =
   ## `proc foo(x: int): int {.flow: MyFrame.} = ...`

@@ -524,7 +524,7 @@ proc ioHook(c: Frame, fd: int, write: bool): Hop =
     return step(p)
   let t = c.task
   if t != nil:
-    t.parked = p; t.parkKind = pkFd; t.parkFd = fd; t.parkWrite = write
+    t.parked = p; t.parkKind = pkFd; t.parkFd = int32(fd); t.parkWrite = write
   if write: (st.wr = p; st.evs.incl Event.Write)
   else: (st.rd = p; st.evs.incl Event.Read)
   inc s.fdWaiting
@@ -583,6 +583,11 @@ proc finishTask(t: TaskBase, st: TaskState, err: ref Exception) =
   t.parkKind = pkNone
   dec sched().live
   if t.doneq != nil: notifyAll(t.doneq)
+  if t.grp != nil:
+    let g = t.grp
+    t.grp = nil                       # break the scope <-> task cycle
+    if st == tsFailed and g.failed == nil: g.failed = t
+    notifyAll(g.ev)
 
 proc completerStage(p: pointer): Hop =
   let t = cast[TaskBase](p)
@@ -662,7 +667,7 @@ proc cancelLocal(t: TaskBase) =
       st.qs = @[]
       st.target = nil
     of pkTimer: cancel(cast[Timer](t.parkRef))
-    of pkFd: dropFdWaiter(t.parkFd, t.parkWrite)
+    of pkFd: dropFdWaiter(int(t.parkFd), t.parkWrite)
     of pkNone: discard
     envOf(leaf).ex = newCancelled()
     schedule(leaf)
@@ -750,8 +755,16 @@ proc runLoop*(until: TaskBase = nil, forever = false) =
         continue
       break
   if until != nil and until.state == tsPending and not forever:
+    let what = case until.parkKind
+      of pkQueue: "a channel / lock / event that nothing can ever signal"
+      of pkAny: "several events (select / any) none of which can fire"
+      of pkTimer: "a timer"
+      of pkFd: "a file descriptor"
+      of pkNone: "nothing (it was never resumed)"
     raise newException(DeadlockError,
-      "event loop ran out of work but the awaited task is still pending")
+      "event loop ran out of work but the awaited task is still pending: it is parked on " &
+      what & "; " & $s.live & " task(s) are alive and all of them are blocked, " &
+      "no timer or I/O is armed")
 
 when flowThreads:
   proc releaseSched*() =
@@ -797,12 +810,22 @@ macro run*(call: typed): untyped =
 # --- structured concurrency ------------------------------------------------
 
 type
-  Scope* = ref object
+  Scope* = ref object of GroupBase
     tasks: seq[TaskBase]
 
-proc newScope*(): Scope = Scope()
+proc newScope*(): Scope = Scope(ev: newWaitQueue())
 
-proc add*(g: Scope, t: TaskBase) = g.tasks.add t
+proc add*(g: Scope, t: TaskBase) =
+  g.tasks.add t
+  if t.state == tsPending:
+    # a child that finishes on this thread reports to the scope directly; one that
+    # lives on another thread is simply waited for in order (see `join`)
+    when flowThreads:
+      if t.sched == cast[pointer](sched().shared): t.grp = g
+    else:
+      t.grp = g
+  elif t.state == tsFailed and g.failed == nil:
+    g.failed = t
 
 proc cancel*(g: Scope) =
   for t in g.tasks: cancel(t)
@@ -821,22 +844,28 @@ proc joinQuiet*(g: Scope) {.flow.} =
     inc i
 
 proc join*(g: Scope) {.flow.} =
-  ## wait for all children. The first failure cancels the rest (fail-fast)
-  ## and is re-raised once every child has stopped.
+  ## wait for all children. The first failure (in time, not in spawn order) cancels
+  ## the rest (fail-fast) and is re-raised once every child has stopped.
   var i = 0
   var err: ref Exception = nil
   while i < g.tasks.len:
     let t = g.tasks[i]
     try:
-      waitDone(t)
+      if err == nil:
+        while t.state == tsPending and g.failed == nil:
+          park(g.ev)
+      else:
+        waitDone(t)
     except CancelledError:
       g.cancel()
       joinQuiet(g)
       raise
-    if t.state == tsFailed and err == nil:
-      err = t.err
-      t.observed = true
+    if err == nil and g.failed != nil:
+      err = g.failed.err
+      g.failed.observed = true
       g.cancel()
+      continue                        # now wait for `t` to stop as well
+    if t.state == tsPending: continue # a child on another thread: keep waiting
     inc i
   if err != nil: raise err
 

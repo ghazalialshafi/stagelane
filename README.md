@@ -50,5 +50,5 @@ run main()
 
 ## Status
 
-Version 0.1. Solid core, tested under sanitizers on Linux. Known gaps: no generic
-flow procs yet, sockets are POSIX-only. See [limits](docs/guide.md#limits).
+Version 0.1. Solid core, tested under sanitizers on Linux. Known gaps: sockets are POSIX-only,
+flow procs cannot be stored in `proc` variables. See [limits](docs/guide.md#limits).

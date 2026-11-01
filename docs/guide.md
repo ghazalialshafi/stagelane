@@ -108,10 +108,9 @@ proc producer(ch: Chan[int]) {.flow.} =
   ch.close()
 
 proc consumer(ch: Chan[int]): int {.flow.} =
-  while true:
-    let v = ch.recvOpt()            # none once closed and drained
-    if v.isNone: break
-    result += v.get
+  eachRecv(ch, v):                  # loops until closed and drained, no exception
+    result += v
+  # same thing by hand: `let v = ch.recvOpt()` is `none` once closed and drained
 
 proc main() {.flow.} =
   let ch = newChan[int](2)          # buffer of 2: back-pressure for free
@@ -266,20 +265,41 @@ the blocking call in a one-line flow proc and `pool.go` it (see [why.md](why.md)
 
 ## Limits
 
-* No generic flow procs (use a generic wrapper around a non-generic flow proc, or a template).
-* No `var` / `openArray` parameters on flow procs (pass a `ref` or a seq).
+* Generic flow procs work (`proc f[T](x: T)`, `typedesc` and `static` parameters). Every
+  explicit generic parameter must be deducible from a parameter type (add
+  `_: typedesc[T]` if not). Generic flow procs always take the suspendable path
+  (no native fast path, no frame pooling), and a type-class parameter such as
+  `x: SomeInteger` needs an explicit `[T: SomeInteger]`.
+* `openArray` / `varargs` parameters are copied into the frame when the proc is called
+  (read-only snapshot). `var` parameters are accepted only on flow procs that never
+  suspend; those can be called but not spawned. Otherwise pass a `ref`.
 * Local `proc`/`type` declarations only in scopes that do not pause. Closures are fine.
 * A `for` over an arbitrary iterator whose body pauses runs over a snapshot. Ranges,
-  `items`, `pairs`, `mitems`, `mpairs` on seq/array/string are exact.
+  `items`, `pairs`, `mitems`, `mpairs` on seq/array/string are exact. Tuple
+  destructuring `for (a, b) in ..` works everywhere, including `mitems` (the names alias
+  the element's fields in place).
 * A flow proc cannot be stored in a `proc` variable yet.
 * `select` works on `Chan`, not `SharedChan`. Sockets are POSIX only.
+* `scope` notices a failing child as soon as it fails (completion order) for children
+  that run on the scheduler thread of the scope; children on other threads are waited
+  for in spawn order.
+* Pragmas such as `{.cast(gcsafe).}:` blocks are kept around the code they enclose.
+  `inline`/`cdecl`-style pragmas on the proc apply to its direct (callable) form.
 
 ## When something does not compile
 
 | message | usually means |
 |---|---|
-| `var / openArray parameters are not supported` | pass a `ref`/`seq` instead |
-| `generic flow procs are not supported yet` | make it non-generic, wrap with a generic proc |
+| `parameter .. is var, which cannot live in a suspendable frame` | the proc suspends: pass a `ref`, or return the new value |
+| `generic parameter .. must appear in a parameter type` | add `_: typedesc[T]` |
 | `ambiguous call ... sleep` | you used `os.sleep`; stagelane's is `delay` |
 | `a suspension point may not appear inside this kind of expression` | pull the call out into a `let` |
 | the unexpected: output mentions `flowC` | a bug in stagelane, please report with the proc |
+
+## Errors you may want to catch
+
+* `DeadlockError` comes out of `run` (not out of a flow proc: by then nothing can run).
+  The message says what the awaited task is parked on and how many tasks are alive.
+* `recv` on a closed, drained channel raises `RecvOnClosedError`; `send` after `close`
+  raises `SendOnClosedError`. Both derive from `ChanClosedError`. Prefer `eachRecv` or
+  `recvOpt` to detect shutdown without an exception.

@@ -61,3 +61,24 @@ proc main4(): string {.flow.} =
 let t0 = epochTime()
 echo run main4()
 echo "elapsed ok: ", epochTime() - t0 < 0.5
+
+# fail-fast is by *time*, not spawn order: a late failure must not wait for a slow earlier child
+proc slowOk(): int {.flow.} =
+  delay(1500)
+  result = 1
+proc quickFail(): int {.flow.} =
+  delay(10)
+  raise newException(ValueError, "quick")
+proc failFast(): string {.flow.} =
+  try:
+    scope g:
+      discard go(g, slowOk())
+      discard go(g, quickFail())
+    result = "no error"
+  except ValueError as e:
+    result = e.msg
+let ffT0 = epochTime()
+let ffR = run failFast()
+let ffEl = epochTime() - ffT0
+echo "failfast: ", ffR, " ", ffEl < 0.8
+doAssert ffR == "quick" and ffEl < 0.8
