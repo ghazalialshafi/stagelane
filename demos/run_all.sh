@@ -29,6 +29,15 @@ else
   files=$(ls d[0-9][0-9]_*.nim)
 fi
 
+# GNU timeout is not installed on stock macOS. perl's alarm survives exec.
+if command -v timeout >/dev/null 2>&1; then
+  timed() { timeout "$@"; }
+elif command -v gtimeout >/dev/null 2>&1; then
+  timed() { gtimeout "$@"; }
+else
+  timed() { perl -e 'alarm shift; exec @ARGV or exit 127' "$@"; }
+fi
+
 pass=0; fail=0; failed=""
 printf "%-34s %-8s %s\n" "DEMO" "RESULT" "TIME"
 printf "%-34s %-8s %s\n" "----" "------" "----"
@@ -45,7 +54,7 @@ for f in $files; do
     tail -15 "$log"; continue
   fi
   start=$(date +%s%N)
-  timeout 120 "$BUILD/$b" >>"$log" 2>&1
+  timed 120 "$BUILD/$b" >>"$log" 2>&1
   rc=$?
   ms=$(( ($(date +%s%N) - start) / 1000000 ))
   if [ $rc -eq 0 ]; then

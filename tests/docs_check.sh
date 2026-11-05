@@ -13,10 +13,18 @@ for f in ["README.md"] + sorted(glob.glob("docs/*.md")):
         open("/tmp/stagelane_docs_check/%s%s.nim" % (name, "_threads" if m.group(1) else ""), "w").write(m.group(2))
 PY
 fail=0
+# GNU timeout is not installed on stock macOS. perl's alarm survives exec.
+if command -v timeout >/dev/null 2>&1; then
+  timed() { timeout "$@"; }
+elif command -v gtimeout >/dev/null 2>&1; then
+  timed() { gtimeout "$@"; }
+else
+  timed() { perl -e 'alarm shift; exec @ARGV or exit 127' "$@"; }
+fi
 for f in $out/*.nim; do
   flags=""
   case $f in *_threads.nim) flags="--threads:on --mm:atomicArc -d:flowThreads";; esac
-  if timeout 60 nim c --path:src $flags --hints:off --warningAsError:Deprecated  \
+  if timed 60 nim c --path:src $flags --hints:off --warningAsError:Deprecated  \
        -d:danger -r -o:${f%.nim} $f >$f.log 2>&1 && ! grep -q "Warning" $f.log; then echo "pass $(basename $f)"
   else echo "FAIL $(basename $f)"; tail -8 $f.log; fail=1; fi
 done
