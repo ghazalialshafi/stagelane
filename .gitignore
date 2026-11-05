@@ -1,0 +1,6 @@
+# Nim outputs binaries next to sources with no extension (e.g. nim c hello.nim -> hello).
+examples/*
+!examples/*.*
+
+tests/*
+!tests/*.*
