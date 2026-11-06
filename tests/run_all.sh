@@ -1,10 +1,12 @@
 #!/bin/sh
 # usage: tests/run_all.sh [nim-flags...]   -- runs every t_*.nim under arc and orc (+ASAN)
 cd "$(dirname "$0")"
+# LeakSanitizer is not available on macOS (Apple clang): keep ASAN's memory-error checks
+[ "$(uname)" = Darwin ] && export ASAN_OPTIONS="${ASAN_OPTIONS:+$ASAN_OPTIONS:}detect_leaks=0"
 fail=0
 for mm in arc orc; do
   for f in t_*.nim; do
-    case $f in t_leak.nim|t_loop1.nim|t_mt.nim) continue;; esac
+    case $f in t_leak.nim|t_loop1.nim|t_mt.nim|t_fastmt.nim) continue;; esac
     out=$(nim c --mm:$mm --hints:off --warningAsError:Deprecated --warningAsError:UnusedImport \
        --passC:-fsanitize=address --passL:-fsanitize=address \
       -d:useMalloc "$@" -r $f 2>&1)
@@ -27,7 +29,7 @@ else echo "FAIL [example] offload"; fail=1; fi
 # every code block in the docs must compile and run
 if sh ./docs_check.sh >/dev/null 2>&1; then echo "pass [docs] all code blocks"; else echo "FAIL [docs]"; fail=1; fi
 # multi-threaded build
-for f in t_mt.nim; do
+for f in t_mt.nim t_fastmt.nim; do
   out=$(nim c --threads:on --mm:atomicArc -d:flowThreads --hints:off --warningAsError:Deprecated \
      --passC:-fsanitize=address --passL:-fsanitize=address \
     -d:useMalloc -r $f 2>&1 | grep -v "LeakSanitizer\|^    #\|SUMMARY\|^$\|leak of\|Direct leak\|Indirect leak")

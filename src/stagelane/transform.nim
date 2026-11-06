@@ -530,7 +530,7 @@ proc newTemp(st: St, e: NimNode): NimNode =
 proc spill(st: St, orig: NimNode, rebuilt: NimNode): NimNode =
   let f = st.newTemp(orig)
   st.emit newAssignment(st.access(f), rebuilt)
-  result = newCall(bindSym"move", st.access(f))
+  result = newCall(bindSym"flowTake", st.access(f))
 
 proc flatOperands(st: St, ops: seq[NimNode], byRef: seq[bool] = @[]): seq[NimNode] =
   ## evaluate operands left to right, hoisting suspension points.  `byRef[i]`
@@ -586,7 +586,7 @@ proc flatCall(st: St, n: NimNode, slot: NimNode): NimNode =
     var ret: NimNode = nil
     if f == nil:
       f = st.newTemp(n)
-      ret = newCall(bindSym"move", st.access(f))
+      ret = newCall(bindSym"flowTake", st.access(f))
     st.emit newCall(bindSym"flowCallInto", st.cId, stagePtr(nxt), call, st.access(f))
     result = ret
   st.cur.terminated = true
@@ -650,7 +650,7 @@ proc flat(st: St, n: NimNode): NimNode =
      nnkWhenStmt:
     let f = st.newTemp(n)
     lower(st, n, st.access(f))
-    return newCall(bindSym"move", st.access(f))
+    return newCall(bindSym"flowTake", st.access(f))
   of nnkDotExpr:
     let f = flatOperands(st, @[n[0]])
     return newDotExpr(f[0], rb(st, n[1]))
@@ -836,8 +836,12 @@ proc lowerFor(st: St, n: NimNode) =
   let it = skipHidden(n[^2])
   let head = st.newStage(st.frames, "for")
   let bodyStage = st.newStage(st.frames, "fbody")
-  let step = st.newStage(st.frames, "fstep")
+  # `fstep` is only entered from the body (forward) and ends in the back-edge hop:
+  # deferring its id makes the jumps into it direct calls instead of driver hops
+  let step = st.newStage(st.frames, "fstep", deferred = true)
   let after = st.newStage(st.frames, "fend", deferred = true)
+  var stepEmit: proc ()
+  let incSym = bindSym"inc"        # resolved here: `bindSym` inside a closure is dynamic
   let name = iterName(it)
   let idxT = ident"int"
   var okIntRange = false
@@ -866,16 +870,17 @@ proc lowerFor(st: St, n: NimNode) =
       newTree(nnkElifBranch, cond, jumpCode(st, bodyStage, st.frames.len, st.frames)),
       newTree(nnkElse, jumpCode(st, after, st.frames.len, st.frames)))
     st.cur.terminated = true
-    st.startStage(step)
-    if rangeIncl:
-      st.emit newTree(nnkIfStmt,
-        newTree(nnkElifBranch, newTree(nnkInfix, ident">=", iv, hiA),
-          jumpCode(st, after, st.frames.len, st.frames)))
-      st.emit newCall(bindSym"inc", iv)
-      st.jump(bodyStage, st.frames.len)
-    else:
-      st.emit newCall(bindSym"inc", iv)
-      st.jump(head, st.frames.len)
+    stepEmit = proc () =
+      st.startStage(step)
+      if rangeIncl:
+        st.emit newTree(nnkIfStmt,
+          newTree(nnkElifBranch, newTree(nnkInfix, ident">=", iv, hiA),
+            jumpCode(st, after, st.frames.len, st.frames)))
+        st.emit newCall(incSym, iv)
+        st.jump(bodyStage, st.frames.len)
+      else:
+        st.emit newCall(incSym, iv)
+        st.jump(head, st.frames.len)
   else:
     # ------------------------------------------------- collections / snapshot
     let ivar = st.newField("idx", idxT)
@@ -969,9 +974,10 @@ proc lowerFor(st: St, n: NimNode) =
         jumpCode(st, bodyStage, st.frames.len, st.frames))),
       newTree(nnkElse, jumpCode(st, after, st.frames.len, st.frames)))
     st.cur.terminated = true
-    st.startStage(step)
-    st.emit newCall(bindSym"inc", copyNimTree(idx))
-    st.jump(head, st.frames.len)
+    stepEmit = proc () =
+      st.startStage(step)
+      st.emit newCall(incSym, copyNimTree(idx))
+      st.jump(head, st.frames.len)
   # ------------------------------------------------------------- loop body
   st.startStage(bodyStage)
   st.loops.add Loop(label: nil, isLoop: true, brk: after, cont: step,
@@ -979,6 +985,7 @@ proc lowerFor(st: St, n: NimNode) =
   lower(st, body, nil)
   discard st.loops.pop
   st.jump(step, st.frames.len)
+  stepEmit()                      # the step stage starts *after* the body (see above)
   st.startStage(after)
 
 proc assignLast(dest, r: NimNode): NimNode =
@@ -1497,7 +1504,7 @@ proc transformImpl(tType, ctorName, ctorParams, directName, directParams,
     if poolable:
       st.exitBody.add newTree(nnkBlockStmt, newEmptyNode(), newStmtList(
         newTree(nnkLetSection, newIdentDefs(r, newEmptyNode(),
-          newCall(bindSym"move", st.access(st.resultField)))),
+          newCall(bindSym"flowTake", st.access(st.resultField)))),
         newTree(nnkIfStmt, newTree(nnkElifBranch,
           newTree(nnkInfix, ident"!=", newDotExpr(st.cId, ident"dest"), newNilLit()),
           newAssignment(newTree(nnkDerefExpr,
@@ -1507,7 +1514,7 @@ proc transformImpl(tType, ctorName, ctorParams, directName, directParams,
     else:
       st.exitBody.add newTree(nnkBlockStmt, newEmptyNode(), newStmtList(
         newTree(nnkLetSection, newIdentDefs(r, newEmptyNode(),
-          newCall(bindSym"move", st.access(st.resultField)))),
+          newCall(bindSym"flowTake", st.access(st.resultField)))),
         newTree(nnkReturnStmt, newCall(bindSym"finishWith", st.pId, r))))
   let first = st.newStage(@[], "start")
   st.startStage(first)
@@ -1524,7 +1531,7 @@ proc transformImpl(tType, ctorName, ctorParams, directName, directParams,
   else:
     let r = ident"flowRes"
     st.emit newTree(nnkLetSection, newIdentDefs(r, newEmptyNode(),
-      newCall(bindSym"move", st.access(st.resultField))))
+      newCall(bindSym"flowTake", st.access(st.resultField))))
     st.emit newTree(nnkReturnStmt, newCall(bindSym"finishWith", st.pId, r))
   st.exitStage.terminated = true
   demoteFields(st)
@@ -1606,8 +1613,10 @@ proc transformImpl(tType, ctorName, ctorParams, directName, directParams,
         release(`pI0`)
         return
     for (f, ty) in st.fields:
-      rbody.add newCall(bindSym"reset", newDotExpr(ident"flowC", f))
-    rbody.add newAssignment(newDotExpr(ident"flowC", ident"ex"), newNilLit())
+      rbody.add newCall(bindSym"flowClear", newDotExpr(ident"flowC", f))
+    let exF = newDotExpr(ident"flowC", ident"ex")
+    rbody.add quote do:
+      if `exF` != nil: `exF` = nil
     rbody.add newAssignment(newDotExpr(ident"flowC", ident"dest"), newNilLit())
     rbody.add newAssignment(newDotExpr(ident"flowC", ident"caller"), newNilLit())
     rbody.add newAssignment(newDotExpr(ident"flowC", ident"task"), newNilLit())
@@ -1633,7 +1642,7 @@ proc transformImpl(tType, ctorName, ctorParams, directName, directParams,
         `poolHead` = envOf(`qId`).next
         envOf(`qId`).next = nil
         dec `poolLen`
-        `eId` = cast[`envT`](unpin(`qId`))
+        copyMem(addr `eId`, unsafeAddr `qId`, sizeof(pointer))   # adopt the pooled pin: no refcount traffic
       else:
         `eId` = `envT`()
     wbody.add inits

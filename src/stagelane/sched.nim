@@ -2,19 +2,37 @@
 ## structured concurrency on top of the continuation core.
 import ./core, ./transform
 import std/[deques, monotimes, os, macros, selectors, tables]
+when defined(windows):
+  import std/nativesockets      # SocketHandle: the Windows (select) selector wants it, not cint
 when flowThreads:
   import std/[locks, atomics]
 
+when defined(windows):
+  # Nim's Windows selector is built on select(), which can watch at most FD_SETSIZE
+  # sockets per event loop (64 unless the macro is raised before winsock2.h is
+  # included).  Raise it; override with -d:flowFdSetSize=N.  Past this number
+  # registering a socket raises IOSelectorsException.
+  const flowFdSetSize* {.intdefine.} = 4096
+  {.passC: "-DFD_SETSIZE=" & $flowFdSetSize.}
+
 when flowThreads:
+  when defined(windows):
+    proc switchToThread(): int32 {.stdcall, dynlib: "kernel32", importc: "SwitchToThread".}
+    proc osYield*() {.inline.} = discard switchToThread()
+  else:
+    proc sched_yield(): cint {.importc: "sched_yield", header: "<sched.h>".}
+    proc osYield*() {.inline.} = discard sched_yield()   ## give the CPU to another runnable thread
   type
     SchedShared* = object
-      ## the part of a scheduler other threads may touch: a mailbox of
-      ## continuations plus a wake-up event
-      lock: Lock
-      buf: ptr UncheckedArray[pointer]
-      cap, head, count: int
+      ## the part of a scheduler other threads may touch: a lock-free mailbox of
+      ## continuations (intrusive MPSC queue, linked through `Frame.next`) plus a
+      ## wake-up event
+      mhead: Atomic[pointer]    # producers: newest node (exchanged)
+      mtail: pointer            # consumer only: oldest node
+      stub: pointer             # permanent dummy node (pinned Frame)
       wake*: SelectEvent
       stopping*: Atomic[bool]
+      sleeping*: Atomic[bool]   ## the owner is (about to be) blocked in `select`: a poster must trigger `wake`
 
 type
   Timer* = ref object of RootObj
@@ -107,24 +125,46 @@ template curTask*(): TaskBase = cast[TaskBase](curTaskP)
 when flowThreads:
   proc initShared(): ptr SchedShared =
     result = cast[ptr SchedShared](allocShared0(sizeof(SchedShared)))
-    initLock(result.lock)
-    result.cap = 64
-    result.buf = cast[ptr UncheckedArray[pointer]](allocShared0(result.cap * sizeof(pointer)))
+    result.stub = pin(Frame())
+    result.mhead.store(result.stub)
+    result.mtail = result.stub
     result.wake = newSelectEvent()
+
+  proc mbLink(sh: ptr SchedShared, c: pointer) {.inline.} =
+    ## wait-free publish of node `c` (Vyukov MPSC): swing the head, then link
+    ## the previous head to us
+    atomicStoreN(addr envOf(c).next, nil, ATOMIC_RELAXED)
+    let prev = sh.mhead.exchange(c, moAcquireRelease)
+    atomicStoreN(addr envOf(prev).next, c, ATOMIC_RELEASE)
 
   proc post*(target: ptr SchedShared, c: pointer) =
     ## hand a pinned continuation to the scheduler that owns `target` (any thread)
-    withLock target.lock:
-      if target.count == target.cap:
-        let ncap = target.cap * 2
-        let nb = cast[ptr UncheckedArray[pointer]](allocShared0(ncap * sizeof(pointer)))
-        for i in 0..<target.count:
-          nb[i] = target.buf[(target.head + i) mod target.cap]
-        deallocShared(target.buf)
-        target.buf = nb; target.cap = ncap; target.head = 0
-      target.buf[(target.head + target.count) mod target.cap] = c
-      inc target.count
-    target.wake.trigger()
+    mbLink(target, c)
+    # Only a sleeping owner needs the (syscall) wake-up; a running one drains its
+    # mailbox on the next loop turn.  The owner publishes `sleeping` *before* its
+    # last look at the mailbox, so this check cannot lose a wake-up.
+    if target.sleeping.load(): target.wake.trigger()
+
+  proc mbPop(sh: ptr SchedShared): pointer =
+    ## consumer side: the oldest node, or nil (also nil while a producer is
+    ## between its two steps; the node shows up on a later call)
+    var tail = sh.mtail
+    var next = cast[pointer](atomicLoadN(addr envOf(tail).next, ATOMIC_ACQUIRE))
+    if tail == sh.stub:
+      if next == nil: return nil
+      sh.mtail = next
+      tail = next
+      next = cast[pointer](atomicLoadN(addr envOf(tail).next, ATOMIC_ACQUIRE))
+    if next != nil:
+      sh.mtail = next
+      return tail
+    if tail != sh.mhead.load(): return nil      # a producer is mid-publish
+    mbLink(sh, sh.stub)                         # re-insert the stub behind `tail`
+    next = cast[pointer](atomicLoadN(addr envOf(tail).next, ATOMIC_ACQUIRE))
+    if next != nil:
+      sh.mtail = next
+      return tail
+    nil
 
 proc initSched() {.noinline.} =
   if theSched == nil:
@@ -140,13 +180,17 @@ template sched*(): Scheduler =
   theSched
 
 when flowThreads:
+  proc inboxEmpty(sh: ptr SchedShared): bool {.inline.} =
+    ## owner only: nothing queued and no producer mid-publish
+    sh.mtail == sh.stub and sh.mhead.load() == sh.stub
+
   proc drainInbox(s: Scheduler) =
     let sh = s.shared
-    withLock sh.lock:
-      while sh.count > 0:
-        s.ready.addLast sh.buf[sh.head]
-        sh.head = (sh.head + 1) mod sh.cap
-        dec sh.count
+    if inboxEmpty(sh): return           # common case: two loads, no lock
+    while true:
+      let c = mbPop(sh)
+      if c == nil: break
+      s.ready.addLast c
 
 proc nowNs*(): int64 = getMonoTime().ticks
 proc nowMs(): int64 {.inline.} = getMonoTime().ticks div 1_000_000
@@ -154,6 +198,21 @@ proc nowMs(): int64 {.inline.} = getMonoTime().ticks div 1_000_000
 proc newWaitQueue*(): WaitQueue =
   result = WaitQueue()
   when flowThreads: initLock(result.lock)
+
+when flowThreads:
+  # A task's completion state and its (lazily created) `doneq` are guarded by one
+  # of a few global stripe locks instead of a per-task WaitQueue + mutex that
+  # would have to be allocated for every task up front.
+  var taskLocks: array[64, Lock]
+  for i in 0..<taskLocks.len: initLock(taskLocks[i])
+  template taskStripe(t: TaskBase): int = int((cast[uint](t) shr 6) and 63)
+
+template tlock(t: TaskBase, body: untyped) =
+  when flowThreads:
+    {.cast(gcsafe).}:
+      withLock taskLocks[taskStripe(t)]: body
+  else:
+    body
 
 template qlock(q: WaitQueue, body: untyped) =
   when flowThreads:
@@ -381,19 +440,19 @@ proc parkSinceHook*(c: Frame, q: WaitQueue, since: int): Hop =
 
 proc parkPendingHook*(c: Frame, target: TaskBase): Hop =
   cancelGuard(c)
-  if target.doneq == nil: target.doneq = newWaitQueue()
-  let q {.cursor.} = target.doneq
   let p = cast[pointer](c)
   let t = c.task
-  if t != nil:
-    t.parked = p; t.parkKind = pkQueue; t.parkQ = cast[pointer](q)
   var finished = false
-  qlock q:
+  tlock target:
     if target.state != tsPending: finished = true
-    else: q.waiters.addLast p
-  if finished:
-    if t != nil: (t.parked = nil; t.parkKind = pkNone)
-    return step(p)
+    else:
+      if target.doneq == nil: target.doneq = newWaitQueue()
+      let q {.cursor.} = target.doneq
+      if t != nil:
+        t.parked = p; t.parkKind = pkQueue; t.parkQ = cast[pointer](q)
+      qlock q:
+        q.waiters.addLast p
+  if finished: return step(p)
   noStep
 
 proc parkAnyHook*(c: Frame, qs: seq[WaitQueue]): Hop =
@@ -423,6 +482,18 @@ proc sleepHook*(c: Frame, ms: int): Hop =
 proc yieldHook*(c: Frame): Hop =
   cancelGuard(c)
   schedule(cast[pointer](c))
+  noStep
+
+const spawnHighWater* {.intdefine: "flowSpawnHighWater".} = 1024
+  ## Backpressure for structured spawns: when this many continuations are already
+  ## queued, `go(scope, ...)` lets them run before the spawner continues, so a
+  ## burst of spawns keeps a bounded working set (hot in cache, recycled memory)
+  ## instead of building a queue as large as the burst.  0 disables the check.
+
+proc spawnHook*(c: Frame): Hop =
+  let p = cast[pointer](c)
+  if sched().ready.len < spawnHighWater: return step(p)    # common case: keep going
+  schedule(p)
   noStep
 
 # --- the stubs (also usable outside flow procs through `blockOn`) ------------
@@ -466,6 +537,7 @@ proc parkPendingCtor(target: TaskBase): Frame = PrimLeaf(fn: leafPending, tgt: t
 proc parkAnyCtor(qs: seq[WaitQueue]): Frame = PrimLeaf(fn: leafAny, qs: qs)
 proc sleepCtor(ms: int): Frame = PrimLeaf(fn: leafSleep, n: ms)
 proc yieldCtor(): Frame = PrimLeaf(fn: leafYield)
+proc spawnPointCtor(): Frame = PrimLeaf(fn: leafYield)
 
 proc park*(q: WaitQueue) {.flowCtor: parkCtor, inlineSuspend: parkHook.} =
   ## suspend the calling flow proc until `notifyOne`/`notifyAll` wakes it
@@ -486,20 +558,30 @@ proc yieldNow*() {.flowCtor: yieldCtor, inlineSuspend: yieldHook.} =
   ## let other tasks run
   blockOn(yieldCtor())
 
+proc spawnPoint*() {.flowCtor: spawnPointCtor, inlineSuspend: spawnHook.} =
+  ## a yield that only happens when the run queue is long (see `spawnHighWater`);
+  ## outside a flow proc there is nothing to yield from
+  discard
+
 # --- fd readiness ----------------------------------------------------------
+
+template selFd(fd: int): untyped =
+  ## the handle type the platform's selector takes
+  when defined(windows): SocketHandle(fd)
+  else: fd.cint                   # exactly what it was before the Windows port
 
 proc syncFd(s: Scheduler, fd: int, st: FdWait) =
   let want = st.evs
   if want == {}:
     if st.registered:
-      s.sel.unregister(fd.cint)
+      s.sel.unregister(selFd(fd))
       st.registered = false
     s.fds.del fd
   elif not st.registered:
-    s.sel.registerHandle(fd.cint, want, 0)
+    s.sel.registerHandle(selFd(fd), want, 0)
     st.registered = true
   else:
-    s.sel.updateHandle(fd.cint, want)
+    s.sel.updateHandle(selFd(fd), want)
 
 proc dropFdWaiter(fd: int, write: bool) =
   let s {.cursor.} = sched()
@@ -572,17 +654,15 @@ proc pollIo(s: Scheduler, timeoutMs: int) =
 # --- tasks -----------------------------------------------------------------
 
 proc finishTask(t: TaskBase, st: TaskState, err: ref Exception) =
-  when flowThreads:
-    qlock t.doneq:
-      t.err = err
-      t.state = st
-  else:
+  var dq: WaitQueue = nil
+  tlock t:
     t.err = err
     t.state = st
+    dq = t.doneq                      # waiters that parked before this point are in it
   t.parked = nil
   t.parkKind = pkNone
   dec sched().live
-  if t.doneq != nil: notifyAll(t.doneq)
+  if dq != nil: notifyAll(dq)
   if t.grp != nil:
     let g = t.grp
     t.grp = nil                       # break the scope <-> task cycle
@@ -601,7 +681,6 @@ proc completerStage(p: pointer): Hop =
 
 proc prepareLaunch(c: Frame, t: TaskBase): pointer =
   ## returns the pin of the root continuation; the task is pinned too
-  when flowThreads: t.doneq = newWaitQueue()     # shared between threads: eager
   c.task = t
   t.fn = completerStage
   t.task = t
@@ -628,6 +707,26 @@ proc goImpl*[R](c: sink Frame, _: typedesc[R]): Task[R] =
     c.dest = addr result.value
   launch(c, result)
 
+proc failInline*(t: TaskBase, e: ref Exception) =
+  ## outcome of a task that ran to completion inside `go` (see `goInline`)
+  t.err = e
+  t.state = if e of CancelledError: tsCancelled else: tsFailed
+
+template goInline*(R: typedesc, call: untyped): untyped =
+  ## `go` of a flow proc that can never suspend.  Such a task has no
+  ## suspension point to interleave at, so running it right away is one of the
+  ## schedules `go` allows -- and it needs no continuation, no queue slot and
+  ## no scheduler round trip: the result is an already finished `Task`.
+  block:
+    let flowT = Task[R]()
+    try:
+      when R is void: call
+      else: flowT.value = call
+      flowT.state = tsDone
+    except Exception as flowE:
+      failInline(flowT, flowE)
+    flowT
+
 macro go*(call: typed): untyped =
   ## start a flow proc as a concurrent task: `let t = go work(1, 2)`
   var cl = call
@@ -636,6 +735,9 @@ macro go*(call: typed): untyped =
     error("go expects a call of a flow proc", call)
   let w = stubCtor(cl[0])
   if w == nil: error("`go` needs a call to a {.flow.} proc", call)
+  when not defined(flowNoInlineGo):
+    if not isSuspCall(cl[0]):
+      return newCall(bindSym"goInline", newCall(ident"typeof", cl), cl)
   let c = newCall(w)
   for a in normArgs(cl): c.add a
   result = newCall(bindSym"goImpl", c, newCall(ident"typeof", cl))
@@ -742,7 +844,27 @@ proc runLoop*(until: TaskBase = nil, forever = false) =
       # idle: block until a timer, an fd or another thread wakes us
       let wait = wheelNextWake(s.wheel)
       if until != nil or forever or s.fdWaiting > 0 or s.wheel.live > 0:
+        # Announce that we are about to block, then look at the mailbox one last
+        # time: a poster either sees `sleeping` (and triggers the wake-up) or
+        # posted early enough for us to see its item here.
+        # Grace period: a thread that blocks the instant it runs dry turns every
+        # post into two context switches (the consumer is usually faster than
+        # the producer).  Yield the CPU a few times first: on one core the
+        # producer then runs on and builds a batch, on many cores this is a
+        # short spin.
+        if s.wheel.live == 0 and s.fdWaiting == 0:
+          var spins = 0
+          while spins < 16 and inboxEmpty(s.shared) and
+                not (forever and s.shared.stopping.load):
+            osYield()
+            inc spins
+          if not inboxEmpty(s.shared): continue
+        s.shared.sleeping.store(true)
+        if not inboxEmpty(s.shared) or (forever and s.shared.stopping.load):
+          s.shared.sleeping.store(false)
+          continue
         pollIo(s, wait)
+        s.shared.sleeping.store(false)
         continue
       break
     else:
@@ -767,17 +889,23 @@ proc runLoop*(until: TaskBase = nil, forever = false) =
       "no timer or I/O is armed")
 
 when flowThreads:
-  proc releaseSched*() =
-    ## free the scheduler of the calling (worker) thread; called on thread exit
+  proc freeShared*(sh: ptr SchedShared) =
+    ## free a scheduler's cross-thread part; only after its thread has been joined
+    ## (other threads may still be inside `post`/`trigger` until then)
+    sh.wake.close()
+    release(sh.stub)
+    deallocShared(sh)
+
+  proc releaseSched*(keepShared = false) =
+    ## free the scheduler of the calling (worker) thread; called on thread exit.
+    ## With `keepShared` the mailbox/wake-up event stay allocated for the joiner
+    ## to `freeShared`.
     drainPools()
     if theSched == nil: return
     let sh = theSched.shared
     theSched.sel.close()
     theSched = nil
-    sh.wake.close()
-    deallocShared(sh.buf)
-    deinitLock(sh.lock)
-    deallocShared(sh)
+    if not keepShared: freeShared(sh)
 
 proc runUntilIdle*() = runLoop(nil)
 
@@ -812,10 +940,26 @@ macro run*(call: typed): untyped =
 type
   Scope* = ref object of GroupBase
     tasks: seq[TaskBase]
+    pruneAt: int                       # compact `tasks` once it grows to this size
+    joining: bool                      # `join` is walking `tasks`: do not move entries
 
-proc newScope*(): Scope = Scope(ev: newWaitQueue())
+proc newScope*(): Scope = Scope(ev: newWaitQueue(), pruneAt: 256)
+
+proc prune(g: Scope) =
+  ## drop the children that finished successfully: nobody can wait for or cancel
+  ## them any more, and each one would otherwise pin its memory until the scope
+  ## closes (a scope that spawns a million short tasks holds a million objects)
+  var j = 0
+  for i in 0..<g.tasks.len:
+    if g.tasks[i].state != tsDone:
+      if i != j: g.tasks[j] = move g.tasks[i]
+      inc j
+  g.tasks.setLen(j)
+  g.pruneAt = max(256, 2 * j)
 
 proc add*(g: Scope, t: TaskBase) =
+  if t.state == tsDone: return         # finished already (see `goInline`): nothing to track
+  if g.tasks.len >= g.pruneAt and not g.joining: prune(g)
   g.tasks.add t
   if t.state == tsPending:
     # a child that finishes on this thread reports to the scope directly; one that
@@ -834,10 +978,15 @@ template go*(g: Scope, call: untyped): untyped =
   ## go `call` as a child of the group
   let flowChild = go call
   g.add flowChild
+  # a child that cannot suspend ran to completion inside `go` (see `goInline`) and
+  # queued nothing: only children that can suspend build up a queue
+  when spawnHighWater > 0:
+    when not neverSuspends(call): spawnPoint()
   flowChild
 
 proc joinQuiet*(g: Scope) {.flow.} =
   ## wait for every child; never raises
+  g.joining = true
   var i = 0
   while i < g.tasks.len:
     waitDone(g.tasks[i])
@@ -846,6 +995,7 @@ proc joinQuiet*(g: Scope) {.flow.} =
 proc join*(g: Scope) {.flow.} =
   ## wait for all children. The first failure (in time, not in spawn order) cancels
   ## the rest (fail-fast) and is re-raised once every child has stopped.
+  g.joining = true
   var i = 0
   var err: ref Exception = nil
   while i < g.tasks.len:
@@ -897,8 +1047,9 @@ proc startTimeout*(ms: int, q: WaitQueue): TimeoutFlag =
   f
 
 proc doneQueue*(t: TaskBase): WaitQueue =
-  if t.doneq == nil: t.doneq = newWaitQueue()
-  t.doneq
+  tlock t:
+    if t.doneq == nil: t.doneq = newWaitQueue()
+    result = t.doneq
 
 proc waitFor*(t: TaskBase, ms: int): bool {.flow.} =
   ## wait up to `ms` milliseconds for `t`; returns whether it finished

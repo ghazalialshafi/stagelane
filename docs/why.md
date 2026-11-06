@@ -62,14 +62,15 @@ those are on the list.
 
 ## How it compares
 
-`std/asyncdispatch`, same machine, `-d:danger --mm:arc`, best of 10:
+`std/asyncdispatch`, same machine, `-d:danger --mm:arc`, median of several runs
+(`bench/bench.nim`, `bench/vs_async.nim`):
 
 | | asyncdispatch | stagelane |
 |---|---|---|
-| call of a proc that pauses (loop) | 83 ns | **22 ns** |
-| spawn a task and await it | 394 ns | **160 ns** |
-| switch between tasks | n/a | **16 ns** |
-| channel message between tasks | n/a (`FutureStream` only) | **30 ns** |
+| call of a proc that pauses (loop) | 100 ns | **~10-15 ns** |
+| spawn a task and await it (it pauses once) | 430 ns | **~130 ns** |
+| switch between tasks | n/a | **~14 ns** |
+| channel message between tasks | n/a (`FutureStream` only) | **~31 ns** |
 | proc that never pauses | allocates a future | **native call, 0 allocations** |
 | CPU loop inside a pausing proc | closure-iterator state machine | **plain C loop (0.4 ns/iter)** |
 
@@ -86,6 +87,45 @@ Features:
 
 (Numbers move +-30% between runs on shared hardware; the ratios are stable.
 Benchmarks are in `bench/`.)
+
+### Against Nimony `.passive` and Go
+
+`bench/compare/` runs the same nine workloads on stagelane, Nimony's `.passive`
+continuations and Go goroutines (`python3 run_bench.py`; needs `nim`, `nimony`, `go`).
+Latest run, **1 shared vCPU**, median of 5, ns/op (lower is better; `cpu` and `timers`
+are total milliseconds), with the thread pools at 4 workers in the multi section:
+
+| benchmark | stagelane | nimony .passive | go |
+|---|---|---|---|
+| call_10M (a call that can pause) | **9.9** | 16.8 | 1.5 (plain call, not comparable) |
+| yield_2M | **11.9** | 90.1 | 108.3 |
+| spawn_200k | **16.8** | 69.0 | 701.4 |
+| fanout_100k_x3yield | **21.0** | 47.5 | 471.0 |
+| pingpong_200k | **51.7** | 460.0 | 193.5 |
+| timers_100k | **27 ms** | 43 ms | 191 ms |
+| cpu_64x2M | 106 ms | 110 ms | **91 ms** |
+| chan_pipe_20000 | **21.9** | HANG | 67.8 |
+| chan_pipe_500000 | **39.0** | HANG | 47.9 |
+| multi: spawn_200k, `pool.go` + await | 239.3 | **69.2** | 469.2 |
+| multi: spawn_200k, `pool.spawn` + `Latch` | 84.0 | **69.8** | 495.1 |
+
+How to read this, honestly:
+
+* **Nimony's spawn is fire-and-forget; `pool.go` returns a handle.** Handle-based
+  `pool.go` pays for a result slot and completion state, so Nimony is ahead in the
+  multi-worker spawn row (about 3.5x for `pool.go`, about 1.2x for the like-for-like
+  `pool.spawn`). That is the one row stagelane loses besides the two below.
+* **cpu_64x2M measures the C compiler, not the runtime.** The loop is a plain loop in
+  every language; plain Nim and stagelane compile it to the same time. Nimony and Go
+  wrap on integer overflow, so the Nim build here uses `--overflowChecks:off` to do the
+  same (about 14% on this loop). Go still wins by a few percent.
+* **`call_10M`:** Go's number is an ordinary function call, which cannot pause, so it is
+  shown for scale only.
+* **One CPU.** Multi-worker rows share a single core, so they show scheduling overhead,
+  not parallel speed-up, and the single-thread rows are the cleanest comparison.
+  Nimony's channel benchmarks hang at 20k / 500k messages in some configurations.
+* Absolute numbers depend on the machine (this was a small cloud VM); the ordering is
+  what repeated across runs.
 
 ## Three things that tend to surprise people
 

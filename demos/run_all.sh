@@ -16,6 +16,26 @@ SRC=../src
 BUILD=${BUILD:-.build}
 mkdir -p "$BUILD"
 
+# GNU timeout is not installed on stock macOS. perl's alarm survives exec.
+if command -v timeout >/dev/null 2>&1; then
+  timed() { timeout "$@"; }
+elif command -v gtimeout >/dev/null 2>&1; then
+  timed() { gtimeout "$@"; }
+else
+  timed() { perl -e 'alarm shift; exec @ARGV or exit 127' "$@"; }
+fi
+
+# milliseconds since the epoch; BSD/macOS `date` has no %N
+if [ "$(date +%N 2>/dev/null)" != "N" ] && [ -n "$(date +%N 2>/dev/null)" ]; then
+  now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
+elif command -v perl >/dev/null 2>&1; then
+  now_ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time()*1000'; }
+elif command -v python3 >/dev/null 2>&1; then
+  now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
+else
+  now_ms() { echo $(( $(date +%s) * 1000 )); }
+fi
+
 if ! command -v "$NIM" >/dev/null 2>&1 && [ ! -x "$NIM" ]; then
   echo "nim not found. Install Nim 2.2+ or run: NIM=/path/to/nim $0"; exit 2
 fi
@@ -27,15 +47,6 @@ if [ $# -gt 0 ]; then
   for n in "$@"; do files="$files $(ls d${n#d}_*.nim 2>/dev/null)"; done
 else
   files=$(ls d[0-9][0-9]_*.nim)
-fi
-
-# GNU timeout is not installed on stock macOS. perl's alarm survives exec.
-if command -v timeout >/dev/null 2>&1; then
-  timed() { timeout "$@"; }
-elif command -v gtimeout >/dev/null 2>&1; then
-  timed() { gtimeout "$@"; }
-else
-  timed() { perl -e 'alarm shift; exec @ARGV or exit 127' "$@"; }
 fi
 
 pass=0; fail=0; failed=""
@@ -53,10 +64,10 @@ for f in $files; do
     printf "%-34s %-8s\n" "$b" "COMPILE-FAIL"; fail=$((fail+1)); failed="$failed $b"
     tail -15 "$log"; continue
   fi
-  start=$(date +%s%N)
+  start=$(now_ms)
   timed 120 "$BUILD/$b" >>"$log" 2>&1
   rc=$?
-  ms=$(( ($(date +%s%N) - start) / 1000000 ))
+  ms=$(( $(now_ms) - start ))
   if [ $rc -eq 0 ]; then
     printf "%-34s %-8s %d ms\n" "$b" "PASS" "$ms"; pass=$((pass+1))
     [ -n "$VERBOSE" ] && sed 's/^/    | /' "$log"

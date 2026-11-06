@@ -37,7 +37,10 @@ proc main(): int {.flow.} =
 echo run main()
 ```
 
-* `go f(x)` starts a task and returns a handle.
+* `go f(x)` starts a task and returns a handle. If `f` can never pause (see
+  `neverSuspends`), it has nothing to interleave with, so it simply runs to completion
+  inside `go` and the handle you get is already finished. Behaviour is the same, it
+  just costs a few nanoseconds instead of a task. (`-d:flowNoInlineGo` turns this off.)
 * `await t` waits and gives you the value (or re-raises the task's exception).
 * `run f(x)` is the program entry: it runs the event loop until `f` is done.
 
@@ -97,6 +100,14 @@ run main()
 
 A `scope` block does not finish until every task started with `s.go` is finished.
 The first failure cancels the rest, then is re-raised. Prefer `scope` over loose `go`.
+
+Two things the scope does for you in a big fan-out: children that finished successfully
+are dropped from its bookkeeping (a scope that starts a million short tasks does not
+hold a million finished tasks), and `s.go` is a *spawn point*: when the run queue
+already holds `flowSpawnHighWater` (default 1024) continuations, the spawner yields
+once so they can run before it starts more. That keeps the working set small and the
+CPU cache hot. It only happens in a burst of spawns of tasks that can pause; code that
+starts a few tasks never notices. `-d:flowSpawnHighWater=0` disables it.
 
 ## 5. Channels and select
 
@@ -244,6 +255,36 @@ proc main() {.flow.} =
 run main()
 ```
 
+Do not need the result? `pool.spawn f(x)` starts a task *without* a handle: one
+allocation, no completion bookkeeping, noticeably cheaper than `pool.go`. Use a
+`Latch` (a thread-safe countdown) or a `SharedChan` to learn that the work is done:
+
+```nim threads
+import stagelane, stagelane/exec
+import std/atomics
+
+var hits: Atomic[int]
+
+proc tick(l: Latch) {.flow.} =
+  discard hits.fetchAdd(1)
+  l.countDown()                     # callable from any thread
+
+proc main() {.flow.} =
+  let pool = newPool(4)
+  let l = newLatch(1000)
+  for i in 1..1000: pool.spawn tick(l)
+  wait(l)                           # suspends until the count reaches zero
+  echo hits.load()                  # 1000
+  pool.shutdown()
+
+run main()
+```
+
+An exception that escapes a `spawn`ed task is not caught by anything (there is no
+handle to carry it), exactly like an unhandled exception in a thread: catch inside the
+task if it can fail. A spawner that posts `flowSpawnBurst` (default 512) items in a
+row yields the CPU once so the workers can drain what is queued.
+
 Why `atomicArc`? Task handles, wait queues and channels are shared between threads,
 and plain ARC/ORC count references non-atomically. Programs that never create a
 `Pool` use plain `--mm:arc` or `--mm:orc` (also with `--threads:on`, Nim's default) and
@@ -260,6 +301,8 @@ the blocking call in a one-line flow proc and `pool.go` it (see [why.md](why.md)
 * `{.flow, heap.}` forces heap frames, for recursion deeper than the C stack.
 * Long CPU loops inside a task: `checkpoint()` or `yieldNow()` now and then.
 * `-d:flowStats` prints how small each proc's frame ended up.
+* Compile-time knobs: `-d:flowNoInlineGo` (always run `go` as a task),
+  `-d:flowSpawnHighWater=N` (0 = off), `-d:flowSpawnBurst=N` (0 = off).
 * Build for speed with `-d:danger`; add `-d:flowAcyclic` under ORC if your locals hold
   no reference cycles.
 

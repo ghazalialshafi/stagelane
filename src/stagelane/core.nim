@@ -95,10 +95,11 @@ proc drainPools*() =
 template envOf*(p: pointer): Frame = cast[Frame](p)
   ## borrow the continuation behind a pin (no refcount traffic)
 
-proc pin*(c: sink Frame): pointer {.inline.} =
-  ## turn an owned reference into a pin (the reference's count now belongs to it)
+proc pin*(c: sink Frame): pointer {.inline, nodestroy.} =
+  ## turn an owned reference into a pin (the reference's count now belongs to it).
+  ## `nodestroy`: the sink parameter is *transferred* to the raw pointer, so the
+  ## compiler must not emit a destructor call for it.
   result = cast[pointer](c)
-  wasMoved(c)
 
 proc unpin*(p: pointer): Frame {.inline.} =
   ## inverse of `pin`: take the pin's reference back (no refcount change)
@@ -227,6 +228,17 @@ proc blockOn*[R](c: sink Frame; _: typedesc[R]): R =
   blockOn(c)
   result = move r
 
+# --- tiny helpers used by generated code ------------------------------------
+
+import std/typetraits
+template flowTake*(x: untyped): untyped =
+  ## move a value out of a field; plain-old-data is just read (no `wasMoved` call)
+  when supportsCopyMem(typeof(x)): x else: move(x)
+
+template flowClear*(x: untyped) =
+  ## put a field back to its default (what `reset` does, without the call)
+  x = default(typeof(x))
+
 # --- marker pragmas -----------------------------------------------------------
 
 template inlineSuspend*(hook: typed) {.pragma.}
@@ -245,22 +257,25 @@ template flowCtor*(prepare: typed) {.pragma.}
   ## constructor ("prepare") that creates the continuation.
 
 template flowCall*(c, nxt, child: untyped) =
-  ## suspend `c` (to resume at stage `nxt` when `child` is done) and run `child`
-  var ch = child
+  ## suspend `c` (to resume at stage `nxt` when `child` is done) and run `child`.
+  ## The freshly built child is adopted as a pin straight away; the fields are
+  ## set through a borrowed view, so no owned local (and no destructor, no
+  ## exception-cleanup frame) is needed on this hot path.
+  let flowChP = pin(child)
+  let flowCh {.cursor.} = envOf(flowChP)
   c.fn = nxt
-  ch.task = c.task
-  ch.caller = cast[pointer](c)
-  let cf = ch.fn
-  return Hop(fn: cf, env: pin(ch))
+  flowCh.task = c.task
+  flowCh.caller = cast[pointer](c)
+  return Hop(fn: flowCh.fn, env: flowChP)
 
 template flowCallInto*(c, nxt, child, slot: untyped) =
-  var ch = child
+  let flowChP = pin(child)
+  let flowCh {.cursor.} = envOf(flowChP)
   c.fn = nxt
-  ch.dest = cast[pointer](addr slot)
-  ch.task = c.task
-  ch.caller = cast[pointer](c)
-  let cf = ch.fn
-  return Hop(fn: cf, env: pin(ch))
+  flowCh.dest = cast[pointer](addr slot)
+  flowCh.task = c.task
+  flowCh.caller = cast[pointer](c)
+  return Hop(fn: flowCh.fn, env: flowChP)
 
 import std/sequtils
 template flowSnapshot*(it: untyped): untyped = toSeq(it)

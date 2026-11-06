@@ -1,6 +1,55 @@
-## stagelane/net — non-blocking TCP on top of the event loop (POSIX).
-import std/[posix, nativesockets, os]
+## stagelane/net — non-blocking TCP on top of the event loop (POSIX and Windows).
+import std/[nativesockets, os]
+when defined(windows):
+  import std/winlean
+else:
+  import std/posix
 import ./core, ./transform, ./sched
+
+# --- the few socket calls that differ between Winsock and POSIX ---------------
+when defined(windows):
+  const wsaEintr = 10004'i32
+  const wsaEwouldblock = 10035'i32
+  proc lastNetError(): int {.inline.} = int(wsaGetLastError())
+  proc errWouldBlock(e: int): bool {.inline.} = e == wsaEwouldblock or e == wsaEintr
+  proc errInProgress(e: int): bool {.inline.} = e == wsaEwouldblock     # connect() on a non-blocking socket
+  proc sockListen(fd: SocketHandle, backlog: int): int {.inline.} = int(winlean.listen(fd, backlog.cint))
+  proc sockName(fd: SocketHandle, sa: ptr SockAddr, len: ptr SockLen): int {.inline.} =
+    int(winlean.getsockname(fd, sa, len))
+  proc sockAccept(fd: SocketHandle, sa: ptr SockAddr, len: ptr SockLen): SocketHandle {.inline.} =
+    winlean.accept(fd, sa, len)
+  proc sockConnect(fd: SocketHandle, sa: ptr SockAddr, len: SockLen): int {.inline.} =
+    int(winlean.connect(fd, sa, len))
+  proc sockRecv(fd: SocketHandle, buf: pointer, n: int): int {.inline.} =
+    int(winlean.recv(fd, cast[cstring](buf), n.cint, 0))
+  proc sockSend(fd: SocketHandle, buf: pointer, n: int): int {.inline.} =
+    int(winlean.send(fd, cast[cstring](buf), n.cint, 0))
+  proc sockPendingError(fd: SocketHandle): int {.inline.} =
+    var err: cint
+    var len = SockLen(sizeof(err))
+    discard winlean.getsockopt(fd, SOL_SOCKET, SO_ERROR, cast[cstring](addr err), addr len)
+    int(err)
+  proc netToHostPort(p: uint16): int {.inline.} = int(nativesockets.ntohs(p))
+else:
+  proc lastNetError(): int {.inline.} = int(errno)
+  proc errWouldBlock(e: int): bool {.inline.} = e == int(EAGAIN) or e == int(EWOULDBLOCK) or e == int(EINTR)
+  proc errInProgress(e: int): bool {.inline.} = e == int(EINPROGRESS)
+  proc sockListen(fd: SocketHandle, backlog: int): int {.inline.} = int(posix.listen(fd, backlog.cint))
+  proc sockName(fd: SocketHandle, sa: ptr SockAddr, len: ptr SockLen): int {.inline.} =
+    int(posix.getsockname(fd, sa, len))
+  proc sockAccept(fd: SocketHandle, sa: ptr SockAddr, len: ptr SockLen): SocketHandle {.inline.} =
+    posix.accept(fd, sa, len)
+  proc sockConnect(fd: SocketHandle, sa: ptr SockAddr, len: SockLen): int {.inline.} =
+    int(posix.connect(fd, sa, len))
+  proc sockRecv(fd: SocketHandle, buf: pointer, n: int): int {.inline.} = int(posix.recv(fd, buf, n, 0))
+  proc sockSend(fd: SocketHandle, buf: pointer, n: int): int {.inline.} =
+    int(posix.send(fd, buf, n, MSG_NOSIGNAL))        # unchanged from before the Windows port
+  proc sockPendingError(fd: SocketHandle): int {.inline.} =
+    var err: cint
+    var len = SockLen(sizeof(err))
+    discard posix.getsockopt(fd, SOL_SOCKET, SO_ERROR, addr err, addr len)
+    int(err)
+  proc netToHostPort(p: uint16): int {.inline.} = int(posix.ntohs(p))
 
 type
   TcpStream* = ref object
@@ -21,9 +70,7 @@ proc resolve(host: string, port: int): ptr AddrInfo =
               nativesockets.SockType.SOCK_STREAM, nativesockets.Protocol.IPPROTO_TCP)
 
 
-proc wouldBlock(): bool =
-  let e = errno
-  e == EAGAIN or e == EWOULDBLOCK or e == EINTR
+proc wouldBlock(): bool = errWouldBlock(lastNetError())
 
 proc listenTcp*(port: int, host = "0.0.0.0", backlog = 128): TcpListener =
   let fd = newTcpSocket()
@@ -33,15 +80,15 @@ proc listenTcp*(port: int, host = "0.0.0.0", backlog = 128): TcpListener =
   if bindAddr(fd, ai.ai_addr, ai.ai_addrlen.SockLen) < 0:
     freeAddrInfo(ai); raiseOSError(osLastError())
   freeAddrInfo(ai)
-  if posix.listen(fd, backlog.cint) < 0: raiseOSError(osLastError())
+  if sockListen(fd, backlog) < 0: raiseOSError(osLastError())
   setNonBlock(fd)
   TcpListener(fd: fd)
 
 proc localPort*(l: TcpListener): int =
   var sa: Sockaddr_in
   var len = SockLen(sizeof(sa))
-  discard posix.getsockname(l.fd, cast[ptr SockAddr](addr sa), addr len)
-  int(posix.ntohs(sa.sin_port))
+  discard sockName(l.fd, cast[ptr SockAddr](addr sa), addr len)
+  netToHostPort(sa.sin_port.uint16)
 
 proc close*(l: TcpListener) = close(l.fd)
 
@@ -55,7 +102,7 @@ proc accept*(l: TcpListener): TcpStream {.flow.} =
   while true:
     var sa: Sockaddr_in
     var len = SockLen(sizeof(sa))
-    let fd = posix.accept(l.fd, cast[ptr SockAddr](addr sa), addr len)
+    let fd = sockAccept(l.fd, cast[ptr SockAddr](addr sa), addr len)
     if fd != osInvalidSocket:
       setNonBlock(fd)
       return TcpStream(fd: fd)
@@ -68,16 +115,14 @@ proc connectTcp*(host: string, port: int): TcpStream {.flow.} =
   if fd == osInvalidSocket: raiseOSError(osLastError())
   setNonBlock(fd)
   var ai = resolve(host, port)
-  let r = posix.connect(fd, ai.ai_addr, ai.ai_addrlen.SockLen)
-  let e = errno
+  let r = sockConnect(fd, ai.ai_addr, ai.ai_addrlen.SockLen)
+  let e = lastNetError()
   freeAddrInfo(ai)
-  if r < 0 and e != EINPROGRESS:
+  if r < 0 and not errInProgress(e):
     close(fd); raiseOSError(OSErrorCode(e))
   if r < 0:
     waitWritable(int(fd))
-    var err: cint
-    var len = SockLen(sizeof(err))
-    discard posix.getsockopt(fd, SOL_SOCKET, SO_ERROR, addr err, addr len)
+    let err = sockPendingError(fd)
     if err != 0:
       close(fd); raiseOSError(OSErrorCode(err))
   return TcpStream(fd: fd)
@@ -91,7 +136,7 @@ proc readSome*(s: TcpStream, n: int = 4096): string {.flow.} =
     return
   var buf = newString(n)
   while true:
-    let r = posix.recv(s.fd, addr buf[0], n, 0)
+    let r = sockRecv(s.fd, addr buf[0], n)
     if r >= 0:
       buf.setLen(r)
       return buf
@@ -110,7 +155,7 @@ proc readLine*(s: TcpStream): string {.flow.} =
     var buf = newString(4096)
     var got = -1
     while got < 0:
-      let r = posix.recv(s.fd, addr buf[0], 4096, 0)
+      let r = sockRecv(s.fd, addr buf[0], 4096)
       if r >= 0: got = r
       elif not wouldBlock(): raiseOSError(osLastError())
       else: waitReadable(int(s.fd))
@@ -125,7 +170,7 @@ proc write*(s: TcpStream, data: string) {.flow.} =
   ## write all of `data`
   var off = 0
   while off < data.len:
-    let r = posix.send(s.fd, unsafeAddr data[off], data.len - off, MSG_NOSIGNAL)
+    let r = sockSend(s.fd, unsafeAddr data[off], data.len - off)
     if r >= 0: off += r
     elif wouldBlock(): waitWritable(int(s.fd))
     else: raiseOSError(osLastError())

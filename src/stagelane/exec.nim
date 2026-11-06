@@ -30,7 +30,7 @@ proc workerMain(a: ptr WorkerArg) {.thread.} =
     a.shared = s.shared
     a.ready.store(true)
     runLoop(nil, forever = true)
-    releaseSched()
+    releaseSched(keepShared = true)   # `shutdown` frees it after the join
 
 proc newPool*(threads: int): Pool =
   ## start `threads` worker threads
@@ -42,7 +42,7 @@ proc newPool*(threads: int): Pool =
   for i in 0..<threads:
     createThread(result.threads[i], workerMain, addr result.args[i])
   for i in 0..<threads:
-    while not result.args[i].ready.load: cpuRelax()
+    while not result.args[i].ready.load: osYield()
 
 proc shutdown*(ex: Pool) =
   ## ask every worker to stop (pending work is abandoned) and join them
@@ -52,8 +52,24 @@ proc shutdown*(ex: Pool) =
     ex.args[i].shared.stopping.store(true)
     ex.args[i].shared.wake.trigger()
   for i in 0..<ex.n: joinThread(ex.threads[i])
+  for i in 0..<ex.n: freeShared(ex.args[i].shared)
   deallocShared(ex.args)
   deallocShared(ex.threads)
+
+const spawnBurst* {.intdefine: "flowSpawnBurst".} = 512
+  ## a spawner that posts this many items in a row yields the CPU once, so the
+  ## workers can drain (and recycle the memory of) what is queued instead of
+  ## the queue growing with the whole burst.  On an idle multi-core machine the
+  ## yield returns at once.  0 disables.
+
+var burst {.threadvar.}: int       # posts since this thread last let the workers run
+
+template throttle(ex: Pool) =
+  when spawnBurst > 0:
+    inc burst
+    if burst >= spawnBurst:
+      burst = 0
+      osYield()
 
 proc goPoolImpl*[R](ex: Pool, idx: int, c: sink Frame, _: typedesc[R]): Task[R] =
   result = Task[R]()
@@ -61,6 +77,7 @@ proc goPoolImpl*[R](ex: Pool, idx: int, c: sink Frame, _: typedesc[R]): Task[R] 
     c.dest = addr result.value
   let i = if idx >= 0: idx mod ex.n else: ex.next.fetchAdd(1) mod ex.n
   launchOn(c, result, ex.args[i].shared)
+  throttle(ex)
 
 macro go*(ex: Pool, call: typed): untyped =
   ## run a flow call on a worker (round robin): `let t = ex.go work(1)`
@@ -71,6 +88,26 @@ macro go*(ex: Pool, call: typed): untyped =
   let c = newCall(w)
   for a in normArgs(cl): c.add a
   result = newCall(bindSym"goPoolImpl", ex, newLit(-1), c, newCall(ident"typeof", cl))
+
+proc spawnPoolImpl*(ex: Pool, idx: int, c: sink Frame) =
+  ## fire-and-forget: no `Task` handle, no completion bookkeeping.  The frame runs
+  ## on a worker and is freed when it finishes.  An exception that escapes it is
+  ## not caught by anyone (like an unhandled exception in a thread).
+  let i = if idx >= 0: idx mod ex.n else: ex.next.fetchAdd(1) mod ex.n
+  post(ex.args[i].shared, pin(c))
+  throttle(ex)
+
+macro spawn*(ex: Pool, call: typed): untyped =
+  ## start a flow call on a worker *without* a result handle: `ex.spawn work(1)`.
+  ## Cheaper than `go` (one allocation, no completion state); use a `Latch`
+  ## or a channel when you need to know that the work is done.
+  var cl = call
+  while cl.kind in {nnkHiddenStdConv, nnkHiddenSubConv, nnkStmtList}: cl = cl[^1]
+  let w = stubCtor(cl[0])
+  if w == nil: error("`spawn` needs a call to a {.flow.} proc", call)
+  let c = newCall(w)
+  for a in normArgs(cl): c.add a
+  result = newCall(bindSym"spawnPoolImpl", ex, newLit(-1), c)
 
 macro goAt*(ex: Pool, worker: int, call: typed): untyped =
   ## like `go` but pinned to a specific worker index
@@ -152,3 +189,28 @@ template recv*[T](ch: SharedChan[T]): T =
       of coClosed: raise newException(SharedChanClosed, "channel closed and drained")
       of coWouldBlock: parkSince(flowCh.recvq, flowE)
     flowV
+
+# --- countdown latch ----------------------------------------------------------
+
+type Latch* = ref object
+  ## thread-safe countdown: `countDown` from any thread / task, `wait` in a flow proc
+  remaining: Atomic[int]
+  q: WaitQueue
+
+proc newLatch*(n: int): Latch =
+  result = Latch(q: newWaitQueue())
+  result.remaining.store(n)
+
+proc countDown*(l: Latch, n = 1) =
+  if l.remaining.fetchSub(n) <= n: notifyAll(l.q)
+
+proc pending*(l: Latch): int = l.remaining.load()
+proc queue*(l: Latch): WaitQueue = l.q
+
+template wait*(l: Latch) =
+  ## suspend until the count reached zero
+  block:
+    let flowL = l
+    while flowL.pending > 0:
+      let flowE = epochOf(flowL.queue)
+      if flowL.pending > 0: parkSince(flowL.queue, flowE)

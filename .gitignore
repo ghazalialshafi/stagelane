@@ -1,6 +1,54 @@
-# Nim outputs binaries next to sources with no extension (e.g. nim c hello.nim -> hello).
-examples/*
-!examples/*.*
+# --- Nim build products -------------------------------------------------------
+nimcache/
+**/nimcache/
+.build/
+**/.build/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.out
+*.dSYM/
+*.log
+gmon.out
+callgrind.out.*
 
+# --- compiled binaries: `nim c -r tests/t_basic.nim` writes tests/t_basic etc. ---
+# Extension-less executables cannot be matched by name, so ignore everything in
+# these directories except the files we keep under version control.
 tests/*
-!tests/*.*
+!tests/*.nim
+!tests/*.sh
+examples/*
+!examples/*.nim
+!examples/*.md
+bench/*
+!bench/*.nim
+!bench/*.md
+!bench/*.py
+!bench/*.sh
+!bench/compare/
+demos/*
+!demos/*.nim
+!demos/*.sh
+!demos/*.md
+
+# --- editors / OS -------------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# bench/compare: build products and run output (keep sources and README)
+bench/compare/*
+!bench/compare/*.nim
+!bench/compare/*.py
+!bench/compare/*.md
+!bench/compare/go/
+bench/compare/go/*
+!bench/compare/go/*.go
+!bench/compare/go/go.mod
