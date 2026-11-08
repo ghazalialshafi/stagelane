@@ -1,4 +1,4 @@
-version       = "0.1.0"
+version       = "0.2.0"
 author        = "stagelane contributors"
 description   = "Stagelane: continuation-passing style and structured concurrency for Nim (ARC/ORC)"
 license       = "MIT"
