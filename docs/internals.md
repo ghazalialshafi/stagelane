@@ -60,9 +60,14 @@ over frames. The mailbox is a lock-free intrusive MPSC queue (Vyukov) threaded t
 lock. The wake-up syscall is only made when the owner has published `sleeping` (it sets
 the flag, looks at the mailbox one last time, then blocks), and an idle thread first
 yields the CPU a few times before it sleeps: a consumer that blocks the instant it runs
-dry turns every post into two context switches. A task's completion state and its
-(lazily created) wait queue are guarded by one of 64 global stripe locks instead of a
-per-task queue + mutex. Pool teardown frees a worker's mailbox only after the thread has
+dry turns every post into two context switches. A task's completion is published without a lock:
+the finisher writes the outcome, then does one seq-cst store of `state`, then looks at the
+(lazily created) `doneq`; a waiter publishes `doneq` with a CAS and then re-checks `state`
+under the queue's own lock (which `notifyAll` also takes), so one side always sees the
+other and no wake-up is lost (this replaced 64 global stripe locks: two atomic operations
+per completion). The exception of a failed task lives in the inherited `Frame.ex` slot
+(`err` is an alias), what a task is parked on shares one `parkRef` pointer, and the five
+flag bytes share a word: `Task[int]` shrank from 144 to 120 bytes including the ARC header (the 128-byte allocator class). Pool teardown frees a worker's mailbox only after the thread has
 been joined. A pause primitive is a *hook* `proc (f: Frame, ...): Hop` called straight
 from the stage with the caller itself as the frame to park; it returns `noStep` after
 parking it, or a hop to continue. `delay`, `yieldNow`, `park`, fd waits and `select`
@@ -91,8 +96,95 @@ AddressSanitizer, checks purity metadata with and without the compile-time table
 (`-d:flowNoPurityTable`), compiles the examples. `tests/docs_check.sh` runs every
 code block in these docs. `t_fast.nim` pins the behaviour of the fast paths (inline `go`,
 scope pruning, spawn point, loop-step fusion, pooled-frame hygiene); `t_fastmt.nim`
-covers the lock-free mailbox, `spawn`, `Latch`, cross-thread await/cancel and pool churn.
+covers the lock-free mailbox, `spawn`, `Latch`, cross-thread await/cancel and pool churn;
+`t_balance.nim` the load counters and both placement policies; `t_flowfn.nim` flow procs as
+values (also run through a pool in `t_balance`); `t_uring.nim` includes deadlines, `writev`,
+`sendmsg`, `close` and a ring per pool worker.
 The threaded tests are also expected to be clean under ThreadSanitizer
 (`--passC:-fsanitize=thread --passL:-fsanitize=thread -d:useMalloc`).
 
 `bench/compare/` is the three-way benchmark against Nimony and Go (`python3 run_bench.py`).
+
+## I/O backends
+
+**Readiness (default).** A task that must wait for a socket parks on it; the loop's
+selector wakes it. On Linux the sockets of `stagelane/net` are *watched*: registered once
+with a private edge-triggered epoll instance (nested in the loop's selector, which only
+sees it become readable) and left registered, so a pause costs no syscall. A readiness
+edge that arrives while nobody waits is remembered per fd. Callers wait only after a
+syscall said "would block", and `net` skips the speculative read when the last one was
+short (the socket is known empty and the next edge says when to read). Plain
+`waitReadable(fd)` on any other fd keeps the old one-shot register/unregister behaviour;
+`watchFd`/`forgetFd` opt an fd in.
+
+**Completion (`ringEnable`, Linux).** `ringcore.nim` is a ~150-line io_uring wrapper
+written from the kernel ABI (setup, three mmaps, SQE/CQE access; it demands
+`FEAT_NODROP` and `EXT_ARG`, so completions cannot be lost and a wait can carry a timeout).
+`sched.nim` adds a pooled `RingOp` per operation: the SQE is filled in place when the
+task suspends (no queue between the task and the ring), the op's address is the SQE's
+`user_data`, and it is pinned while the kernel owns it. A loop turn ends with one
+`io_uring_enter` for everything queued; completions are read from shared memory with no
+syscall. With nothing else to wait on (no selector in use) the idle wait is the same
+syscall (`GETEVENTS` + timeout, bounded by the next timer); otherwise the ring fd is
+registered in the selector, so timers, sockets and cross-thread wake-ups share one loop.
+Cancellation submits `ASYNC_CANCEL` and keeps the task parked until the kernel reports
+back: it may still be writing into the caller's buffer. If the operation finished anyway,
+its result (an accepted fd) is delivered and the cancel takes effect at the next
+suspension, so nothing leaks.
+
+The design follows Nimony's `std/ioring` (completion operations with a per-operation
+record, deferred completion on cancel, timed submit-and-wait, fallback when the ring is
+unavailable). Differences: no per-operation slot allocation and no intermediate queue
+(pooled records, SQE written at suspension), coexistence with the readiness loop instead
+of replacing it (one process can mix both), opt-in per thread, and caller-owned buffers
+throughout (no per-operation heap message for `recv`/`send`).
+
+## Placement
+
+`Pool.go`/`spawn` choose a worker when the task is started; afterwards a task never moves.
+*Round robin* (default) keeps a per-spawning-thread counter: no shared state is touched.
+*Least loaded* keeps two counters per worker in `SchedShared`: `posted` (incremented by
+spawners) and `done` (written only by the worker); `posted - done` is the number of unfinished
+roots. A spawn draws one random number, derives two distinct candidates from it and takes the
+one with the smaller load (power of two choices). A `go` task is counted when its `Task`
+finishes (`finishTask`); a detached `spawn` has no handle, so its root frame gets the worker's
+*sink* frame as caller and the sink's stage counts the completion (an exception that escapes
+still leaves the driver, as before; `releaseChain` stops in front of the sink because the
+chain does not own it). Round-robin pools skip all of this. `SchedShared` is laid out in
+three 64-byte lines: written by posters (`mhead`, `posted`, `sleeping`), written by the owner
+(`mtail`, `done`, ...), and rarely written.
+
+Work stealing is not implemented. Tasks queue in a single-consumer mailbox and an owner-private
+ready list; a worker stuck in a long CPU-bound task cannot be relieved by asking it to give
+work away, and making the new-task queue multi-consumer would put a lock or CAS back on the
+spawn path. A design that would work: a per-worker stealable queue (Chase-Lev deque or a
+short spin-locked ring) for not-yet-started roots, with `task.sched` re-pointed by the thief
+before the root first runs.
+
+## Flow procs as values
+
+`flowfn.nim`. Every flow proc has a *constructor* that builds its continuation from the
+arguments. `FlowFn[P]` stores a nimcall thunk (`proc (args..., env: pointer): Frame`) and an
+`env` (a `ref` box holding bound arguments, or nil). `flowFn(f, bound...)` is a macro that
+generates the thunk and box for `f`; `call(h, args...)` expands to
+`runFrame[R](flowInvokeR<n>(h, args...))`. `runFrame` is an ordinary stub marked
+`{.flowCtor: identCtor.}` whose "constructor" is the identity, so the *unchanged* transform
+sees a suspending call whose child frame is the argument; `go`, `spawn` and `scope.go` need no
+special case, and outside flow procs `runFrame` is `blockOn`. The per-arity `flowInvoke*`
+generics exist so that the `FlowFn` expression is evaluated exactly once and no temporary
+(which `go` would drop) is needed. Because the transform and `go` only look at the stub, none of
+the pure-proc fast paths apply to values (a value call always builds a frame).
+
+## io_uring additions
+
+* **Per-operation deadlines.** `timeoutMs` on the ring calls submits the operation and an
+  `IORING_OP_LINK_TIMEOUT` as a linked pair (the pair is claimed adjacently: a free-slot check
+  happens first, since `getSqe` zeroes entries and a half-filled one must never be submitted).
+  The timeout's own CQE has `user_data` 0 and is skipped; the operation's `-ECANCELED` is
+  reported as `-ETIME` when no cancel was requested. The `__kernel_timespec` lives in the pooled
+  `RingOp`, so it stays put while the kernel reads it.
+* `ringWritev`, `ringSendmsg`, `ringClose`.
+* `newPool(n, ring = true)` runs `ringEnable()` at the start of each worker; the ring is
+  per-scheduler, so nothing else changes. Not done: multishot accept/recv (needs a
+  several-completions-per-operation model in `ringReap`), registered files/buffers (they change
+  what an fd means to `net`'s bookkeeping), linked send+recv. None of them were measured.

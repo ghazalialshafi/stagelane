@@ -7,27 +7,27 @@ ns/op (lower is better); cpu and timers are total ms; HANG = no result within th
 
 | benchmark | stagelane | nimony .passive | go | best |
 |---|---|---|---|---|
-| call_10M | 9.9 | 16.8 | 1.5 | go (go: plain call, not comparable) |
-| yield_2M | 11.9 | 90.1 | 108.3 | stagelane |
-| spawn_200k | 16.8 | 69.0 | 701.4 | stagelane |
-| fanout_100k_x3yield | 21.0 | 47.5 | 471.0 | stagelane |
-| pingpong_200k | 51.7 | 460.0 | 193.5 | stagelane |
-| timers_100k | 27 ms | 43 ms | 191 ms | stagelane |
-| cpu_64x2M | 106 ms | 110 ms | 91 ms | go |
-| chan_pipe_20000 | 21.9 | HANG | 67.8 | stagelane |
-| chan_pipe_500000 | 39.0 | HANG | 47.9 | stagelane |
+| call_10M | 10.1 | 14.5 | 1.5 | go (go: plain call, not comparable) |
+| yield_2M | 10.5 | 96.7 | 112.1 | stagelane |
+| spawn_200k | 14.6 | 63.0 | 926.5 | stagelane |
+| fanout_100k_x3yield | 23.8 | 52.0 | 617.6 | stagelane |
+| pingpong_200k | 48.8 | 495.3 | 159.2 | stagelane |
+| timers_100k | 33 ms | 49 ms | 241 ms | stagelane |
+| cpu_64x2M | 105 ms | 116 ms | 111 ms | stagelane |
+| chan_pipe_20000 | 19.1 | 186.2 | 47.9 | stagelane |
+| chan_pipe_500000 | 23.5 | HANG | 46.4 | stagelane |
 
 ## multi
 
 | benchmark | stagelane | nimony .passive | go | best |
 |---|---|---|---|---|
-| call_10M | 9.7 | 16.9 | 1.5 | go (go: plain call, not comparable) |
-| yield_2M | 11.8 | 83.7 | 79.9 | stagelane |
-| spawn_200k | 239.3 | 69.2 | 469.2 | nimony |
-| spawn_detached_200k (nimony/go: their fire-and-forget spawn) | 84.0 | 69.8 | 495.1 | nimony |
-| fanout_100k_x3yield | 21.0 | 48.6 | 231.7 | stagelane |
-| pingpong_200k | 52.9 | 480.7 | 179.3 | stagelane |
-| timers_100k | 28 ms | 45 ms | 169 ms | stagelane |
-| cpu_64x2M | 106 ms | 112 ms | 94 ms | go |
-| chan_pipe_20000 | 21.6 | 173.3 | 70.4 | stagelane |
-| chan_pipe_500000 | 35.0 | HANG | 108.2 | stagelane |
+| call_10M | 10.3 | 18.5 | 1.5 | go (go: plain call, not comparable) |
+| yield_2M | 10.6 | 91.9 | 96.9 | stagelane |
+| spawn_200k | 190.5 | 64.8 | 579.8 | nimony |
+| spawn_detached_200k (nimony/go: their fire-and-forget spawn) | 67.1 | 70.3 | 621.2 | stagelane |
+| fanout_100k_x3yield | 31.4 | 59.2 | 301.9 | stagelane |
+| pingpong_200k | 46.3 | 443.6 | 195.6 | stagelane |
+| timers_100k | 33 ms | 45 ms | 213 ms | stagelane |
+| cpu_64x2M | 112 ms | 121 ms | 115 ms | stagelane |
+| chan_pipe_20000 | 23.8 | HANG | 70.2 | stagelane |
+| chan_pipe_500000 | 32.3 | HANG | 65.1 | stagelane |

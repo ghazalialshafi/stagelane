@@ -2,6 +2,9 @@
 ## structured concurrency on top of the continuation core.
 import ./core, ./transform
 import std/[deques, monotimes, os, macros, selectors, tables]
+when defined(linux):
+  import ./ringcore
+  import std/[epoll, posix]      # persistent (edge-triggered) fd registration, see `watchFd`
 when defined(windows):
   import std/nativesockets      # SocketHandle: the Windows (select) selector wants it, not cint
 when flowThreads:
@@ -26,13 +29,24 @@ when flowThreads:
     SchedShared* = object
       ## the part of a scheduler other threads may touch: a lock-free mailbox of
       ## continuations (intrusive MPSC queue, linked through `Frame.next`) plus a
-      ## wake-up event
+      ## wake-up event.  Laid out in cache lines by who writes what, so that posting
+      ## threads and the owner do not fight over one line (`cacheAlign`).
+      # --- line 0: written by posting threads
       mhead: Atomic[pointer]    # producers: newest node (exchanged)
+      posted*: Atomic[int]      ## root tasks handed to this scheduler by a `balLeastLoaded` pool
+      sleeping*: Atomic[bool]   ## the owner is (about to be) blocked in `select`: a poster must trigger `wake`
+      pad0: array[40, byte]
+      # --- line 1: written by the owner
       mtail: pointer            # consumer only: oldest node
+      done*: int                ## root tasks that finished here (see `posted`); written by the owner only,
+                                ## read racily (relaxed) by whoever picks a worker: `posted - done` is its load
       stub: pointer             # permanent dummy node (pinned Frame)
+      spawnSink*: pointer       ## pinned dummy caller of detached (`spawn`ed) roots of a least-loaded pool
+      rawBase: pointer          # what `allocShared0` returned (this object is aligned inside it)
+      pad1: array[24, byte]
+      # --- line 2: rarely written
       wake*: SelectEvent
       stopping*: Atomic[bool]
-      sleeping*: Atomic[bool]   ## the owner is (about to be) blocked in `select`: a poster must trigger `wake`
 
 type
   Timer* = ref object of RootObj
@@ -87,11 +101,30 @@ proc `=destroy`(w: var Wheel) =
 proc `=copy`(dest: var Wheel, src: Wheel) {.error.}
 
 
+when defined(linux):
+  type
+    RingOp* = ref object
+      ## one io_uring operation: filled in place, pooled, pinned (`GC_ref`) while the
+      ## kernel owns it (its address is the SQE's user_data)
+      code*: uint8
+      fd*: int32
+      buf*: pointer
+      len*: int
+      off*: int64
+      opFlags*: uint32
+      timeoutMs*: int            ## > 0: the operation is linked to a timeout (`LINK_TIMEOUT`)
+      ts: array[2, int64]        # the timeout as a `__kernel_timespec`; must stay put while the kernel reads it
+      res*: int                  ## the kernel's result: >= 0 or -errno (-ETIME: the deadline passed)
+      waiter: pointer            # pinned continuation to resume
+      cancelled: bool
+
 type
   FdWait = ref object
     rd, wr: pointer            # pinned continuations waiting for readability / writability
     evs: set[Event]
     registered: bool
+    persistent: bool           # Linux: registered once, edge-triggered (see `watchFd`)
+    rdReady, wrReady: bool     # persistent: an edge was seen while nobody was waiting
 
 proc `=destroy`(f: var typeof(FdWait()[])) =
   if f.rd != nil: releaseChain(f.rd)
@@ -111,11 +144,19 @@ type
       shared*: ptr SchedShared
     sel: Selector[int]
     fds: Table[int, FdWait]
-    fdWaiting: int
+    fdWaiting: int             # tasks parked on an fd (persistent or not)
     ready: FrameList
     wheel: Wheel
     live*: int
     steps*: uint64
+    # persistent-fd bookkeeping: kept at the end so the hot fields above keep their offsets
+    npWait: int                # tasks parked on a non-persistent fd
+    pepOn: bool                # the persistent-fd epoll instance exists
+    pepFd: cint
+    when defined(linux):
+      ring: Ring               # io_uring instance (nil until `ringEnable`)
+      ringInflight: int
+      ringPool: seq[RingOp]
 
 
 var theSched {.threadvar.}: Scheduler
@@ -123,8 +164,30 @@ var curTaskP {.threadvar.}: pointer
 template curTask*(): TaskBase = cast[TaskBase](curTaskP)
 
 when flowThreads:
+  proc spawnFailed(p: pointer) {.noinline.} =
+    # nobody catches an exception of a detached task: let it escape the driver, as it
+    # did when the root had no caller.  `unwindTo` releases the frame it runs: take an
+    # extra reference first, the sink is shared by every spawn.
+    let e = popEx(envOf(p))
+    GC_ref(envOf(p))
+    raise e
+
+  proc spawnDoneStage(p: pointer): Hop =
+    ## The caller of every detached (`spawn`ed) root of a least-loaded pool: runs on the
+    ## worker when one has finished, so the worker's load can be kept without a handle.
+    let sh = theSched.shared
+    atomicStoreN(addr sh.done, sh.done + 1, ATOMIC_RELAXED)
+    if envOf(p).ex != nil: spawnFailed(p)
+    noStep
+
+  sinkStage = spawnDoneStage
+
   proc initShared(): ptr SchedShared =
-    result = cast[ptr SchedShared](allocShared0(sizeof(SchedShared)))
+    # 64-byte aligned, so that the three groups of fields above sit in separate cache lines
+    let raw = allocShared0(sizeof(SchedShared) + 64)
+    result = cast[ptr SchedShared]((cast[uint](raw) + 63'u) and not 63'u)
+    result.rawBase = raw
+    result.spawnSink = pin(Frame(fn: spawnDoneStage))
     result.stub = pin(Frame())
     result.mhead.store(result.stub)
     result.mtail = result.stub
@@ -199,26 +262,55 @@ proc newWaitQueue*(): WaitQueue =
   result = WaitQueue()
   when flowThreads: initLock(result.lock)
 
-when flowThreads:
-  # A task's completion state and its (lazily created) `doneq` are guarded by one
-  # of a few global stripe locks instead of a per-task WaitQueue + mutex that
-  # would have to be allocated for every task up front.
-  var taskLocks: array[64, Lock]
-  for i in 0..<taskLocks.len: initLock(taskLocks[i])
-  template taskStripe(t: TaskBase): int = int((cast[uint](t) shr 6) and 63)
+# --- task completion state ----------------------------------------------------
+# A task's outcome (its value, its exception in `ex`) is written first and then
+# *published* with one sequentially consistent store of `state`; readers use acquire
+# loads (`stateOf`).  The queue of continuations waiting for completion (`doneq`) is
+# created by the first waiter and published with a CAS (`ensureDoneqP`).  No lock is
+# involved: the finisher stores `state` and then looks at `doneq`; a waiter publishes
+# `doneq` and then looks at `state` (under the queue's own lock, which is also what
+# `notifyAll` takes), so one of them always sees the other and a wake-up cannot be
+# lost.  (This replaced 64 global stripe locks that cost two atomic operations on
+# every completion.)
 
-template tlock(t: TaskBase, body: untyped) =
+template stateOf*(t: TaskBase): TaskState =
+  ## the state of a task, safe to read from any thread
   when flowThreads:
-    {.cast(gcsafe).}:
-      withLock taskLocks[taskStripe(t)]: body
+    TaskState(atomicLoadN(cast[ptr uint8](addr t.state), ATOMIC_ACQUIRE))
   else:
-    body
+    t.state
+
+template publishState(t: TaskBase, st: TaskState) =
+  when flowThreads:
+    atomicStoreN(cast[ptr uint8](addr t.state), uint8(st), ATOMIC_SEQ_CST)
+  else:
+    t.state = st
 
 template qlock(q: WaitQueue, body: untyped) =
   when flowThreads:
     withLock q.lock: body
   else:
     body
+
+proc ensureDoneqP(t: TaskBase): pointer =
+  ## the completion queue of `t` (borrowed: the task owns it), created on first use.
+  ## With threads two waiters may race: the CAS picks one queue, the loser's is dropped.
+  when flowThreads:
+    let slot = cast[ptr pointer](addr t.doneq)
+    result = atomicLoadN(slot, ATOMIC_ACQUIRE)
+    if result == nil:
+      let fresh = newWaitQueue()
+      GC_ref(fresh)                         # the reference the field will own
+      var expected: pointer = nil
+      if atomicCompareExchangeN(slot, addr expected, cast[pointer](fresh), false,
+                                ATOMIC_SEQ_CST, ATOMIC_ACQUIRE):
+        result = cast[pointer](fresh)
+      else:
+        GC_unref(fresh)
+        result = expected
+  else:
+    if t.doneq == nil: t.doneq = newWaitQueue()
+    result = cast[pointer](t.doneq)
 
 proc schedule*(c: pointer) =
   ## queue a pinned continuation (routed to its owning thread when needed)
@@ -418,7 +510,7 @@ proc parkHook*(c: Frame, q: WaitQueue): Hop =
   let p = cast[pointer](c)
   let t = c.task
   if t != nil:
-    t.parked = p; t.parkKind = pkQueue; t.parkQ = cast[pointer](q)
+    t.parked = p; t.parkKind = pkQueue; t.parkRef = cast[pointer](q)
   qlock q:
     q.waiters.addLast p
   noStep
@@ -429,7 +521,7 @@ proc parkSinceHook*(c: Frame, q: WaitQueue, since: int): Hop =
   var stale = false
   let t = c.task
   if t != nil:
-    t.parked = p; t.parkKind = pkQueue; t.parkQ = cast[pointer](q)
+    t.parked = p; t.parkKind = pkQueue; t.parkRef = cast[pointer](q)
   qlock q:
     if q.epoch != since: stale = true
     else: q.waiters.addLast p
@@ -441,17 +533,18 @@ proc parkSinceHook*(c: Frame, q: WaitQueue, since: int): Hop =
 proc parkPendingHook*(c: Frame, target: TaskBase): Hop =
   cancelGuard(c)
   let p = cast[pointer](c)
+  if stateOf(target) != tsPending: return step(p)       # common case for a handle awaited late
   let t = c.task
+  let q {.cursor.} = cast[WaitQueue](ensureDoneqP(target))
   var finished = false
-  tlock target:
-    if target.state != tsPending: finished = true
+  qlock q:
+    # `notifyAll` (called by the finisher after it published the state) takes this
+    # same lock, so either we see the state here or it sees us in the queue
+    if stateOf(target) != tsPending: finished = true
     else:
-      if target.doneq == nil: target.doneq = newWaitQueue()
-      let q {.cursor.} = target.doneq
       if t != nil:
-        t.parked = p; t.parkKind = pkQueue; t.parkQ = cast[pointer](q)
-      qlock q:
-        q.waiters.addLast p
+        t.parked = p; t.parkKind = pkQueue; t.parkRef = cast[pointer](q)
+      q.waiters.addLast p
   if finished: return step(p)
   noStep
 
@@ -510,6 +603,8 @@ type
     n: int
     tgt: TaskBase
     qs: seq[WaitQueue]
+    when defined(linux):
+      op: RingOp
 
 proc leafPark(p: pointer): Hop =
   let c = cast[PrimLeaf](p)
@@ -570,6 +665,196 @@ template selFd(fd: int): untyped =
   when defined(windows): SocketHandle(fd)
   else: fd.cint                   # exactly what it was before the Windows port
 
+proc ensureSel(s: Scheduler) =
+  ## create the loop's selector on first need (and make the ring pollable through it)
+  if s.sel == nil:
+    s.sel = newSelector[int]()
+    when defined(linux):
+      if s.ring != nil: s.sel.registerHandle(s.ring.fd, {Event.Read}, -2)
+
+when defined(linux):
+  proc ringEnable*(entries = 1024): bool =
+    ## Switch this thread's scheduler to io_uring for `stagelane/uring` operations.
+    ## False (and nothing changes) when the kernel cannot do it.
+    let s {.cursor.} = sched()
+    if s.ring != nil: return true
+    let r = newRing(entries)
+    if r == nil: return false
+    s.ring = r
+    if s.sel != nil: s.sel.registerHandle(r.fd, {Event.Read}, -2)
+    true
+
+  proc ringActive*(): bool = sched().ring != nil
+
+  proc ringAcquire*(code: uint8, fd: int, buf: pointer, len: int, off: int64,
+                    opFlags: uint32, timeoutMs = 0): RingOp =
+    let s {.cursor.} = sched()
+    if s.ringPool.len > 0: result = s.ringPool.pop()
+    else: result = RingOp()
+    result.code = code; result.fd = int32(fd); result.buf = buf; result.len = len
+    result.off = off; result.opFlags = opFlags
+    result.res = 0; result.waiter = nil; result.cancelled = false
+    result.timeoutMs = timeoutMs
+    if timeoutMs > 0:
+      result.ts[0] = int64(timeoutMs div 1000)
+      result.ts[1] = int64(timeoutMs mod 1000) * 1_000_000
+
+  proc ringRelease*(op: RingOp) =
+    let s {.cursor.} = sched()
+    if s.ringPool.len < 4096: s.ringPool.add op
+
+  proc ringSqe(s: Scheduler): ptr Sqe =
+    result = s.ring.getSqe()
+    if result == nil:                 # full: let the kernel consume what is queued, retry
+      discard s.ring.submit()
+      result = s.ring.getSqe()
+
+  proc ringReap(s: Scheduler): int =
+    ## complete every finished operation (shared-memory read, no syscall)
+    let r = s.ring
+    r.reap(cqe):
+      inc result
+      if cqe.userData != 0:          # 0 marks the cancel requests themselves
+        let op = cast[RingOp](cqe.userData)
+        op.res = int(cqe.res)
+        let p = op.waiter
+        op.waiter = nil
+        dec s.ringInflight; dec s.fdWaiting
+        if p != nil:
+          # cancelled and the kernel agrees: resume with CancelledError.  If the
+          # operation finished anyway, its result (an accepted fd, bytes read) is
+          # delivered and the cancel takes effect at the task's next suspension.
+          if op.cancelled and cqe.res == -125'i32: envOf(p).ex = newCancelled()
+          elif op.timeoutMs > 0 and cqe.res == -125'i32:
+            op.res = -62                 # ECANCELED from our own linked timeout: the deadline passed (ETIME)
+          wake(p)
+        GC_unref(op)
+
+  proc ringHook*(c: Frame, op: RingOp): Hop =
+    cancelGuard(c)
+    let s {.cursor.} = sched()
+    if op.timeoutMs > 0 and s.ring.freeSlots < 2: discard s.ring.submit()   # the pair must be adjacent
+    let sqe = ringSqe(s)
+    if sqe == nil: raise newException(IOError, "io_uring submission queue is full")
+    if op.timeoutMs > 0:
+      # linked pair: the operation, then a timeout that cancels it when it fires first.  The
+      # timeout's own completion has user_data 0 and is ignored by `ringReap`.
+      let tsqe = ringSqe(s)
+      if tsqe == nil: raise newException(IOError, "io_uring submission queue is full")
+      tsqe.opcode = OpLinkTimeout
+      tsqe.fd = -1
+      tsqe.`addr` = cast[uint64](addr op.ts)
+      tsqe.len = 1
+      tsqe.userData = 0
+      sqe.flags = SqeIoLink
+    sqe.opcode = op.code
+    sqe.fd = op.fd
+    sqe.`addr` = cast[uint64](op.buf)
+    sqe.len = uint32(op.len)
+    sqe.off = cast[uint64](op.off)
+    sqe.opFlags = op.opFlags
+    sqe.userData = cast[uint64](op)
+    GC_ref(op)                        # the kernel now holds the address
+    let p = cast[pointer](c)
+    op.waiter = p
+    let t = c.task
+    if t != nil:
+      t.parked = p; t.parkKind = pkRing; t.parkRef = cast[pointer](op)
+    inc s.ringInflight; inc s.fdWaiting
+    noStep
+
+  proc ringCancel(op: RingOp) =
+    ## ask the kernel to abort `op`; the task stays parked until the kernel reports
+    ## back, because it may still be writing into the caller's buffer
+    let s {.cursor.} = sched()
+    op.cancelled = true
+    let sqe = ringSqe(s)
+    if sqe == nil: return
+    sqe.opcode = OpAsyncCancel
+    sqe.fd = -1
+    sqe.`addr` = cast[uint64](op)
+    sqe.userData = 0
+
+proc leafRing(p: pointer): Hop =
+  let c = cast[PrimLeaf](p)
+  c.fn = doneStage
+  when defined(linux): ringHook(c, c.op)
+  else: noStep
+
+when defined(linux):
+  proc ringWaitCtor(op: RingOp): Frame = PrimLeaf(fn: leafRing, op: op)
+
+  proc ringWait*(op: RingOp) {.flowCtor: ringWaitCtor, inlineSuspend: ringHook.} =
+    ## submit `op` and suspend until the kernel completes it (see `stagelane/uring`)
+    blockOn(ringWaitCtor(op))
+
+when defined(linux):
+  proc pepRegister(s: Scheduler, fd: int) =
+    ## add `fd` to the persistent epoll set (edge-triggered, read+write+hangup) once
+    if not s.pepOn:
+      s.ensureSel()
+      s.pepFd = epoll_create1(O_CLOEXEC)
+      doAssert s.pepFd >= 0, "epoll_create1 failed"
+      s.pepOn = true
+      # the instance is itself pollable: the loop's selector wakes when it has events
+      s.sel.registerHandle(s.pepFd, {Event.Read}, -1)
+    var ev: EpollEvent
+    ev.events = uint32(EPOLLIN or EPOLLOUT or EPOLLRDHUP or EPOLLET)
+    ev.data.fd = fd.cint
+    if epoll_ctl(s.pepFd, EPOLL_CTL_ADD, fd.cint, addr ev) < 0:
+      if errno == EEXIST:            # a stale registration for a reused fd number
+        discard epoll_ctl(s.pepFd, EPOLL_CTL_MOD, fd.cint, addr ev)
+      else: raiseOSError(osLastError())
+
+  proc pepHarvest(s: Scheduler) =
+    ## collect pending edges without blocking; wake the waiters, remember the rest
+    var evs: array[64, EpollEvent]
+    while true:
+      let n = int(epoll_wait(s.pepFd, addr evs[0], 64, 0))
+      for i in 0..<n:
+        let fd = int(evs[i].data.fd)
+        let st = s.fds.getOrDefault(fd)
+        if st == nil or not st.persistent: continue
+        let e = evs[i].events
+        let bad = (e and uint32(EPOLLERR or EPOLLHUP or EPOLLRDHUP)) != 0
+        if bad or (e and uint32(EPOLLIN)) != 0:
+          if st.rd != nil:
+            let leaf = st.rd
+            st.rd = nil; dec s.fdWaiting
+            wake(leaf)
+          else: st.rdReady = true
+        if bad or (e and uint32(EPOLLOUT)) != 0:
+          if st.wr != nil:
+            let leaf = st.wr
+            st.wr = nil; dec s.fdWaiting
+            wake(leaf)
+          else: st.wrReady = true
+      if n < 64: break
+
+proc watchFd*(fd: int) =
+  ## Mark `fd` as long-lived: register it with the kernel once, on its first wait, and
+  ## keep it registered (Linux, edge-triggered), instead of one add + one remove per
+  ## wait.  For sockets that wait often (see `stagelane/net`, which does this for you).
+  ## Rules: wait on it only after the syscall reported "would block"; close it with
+  ## `forgetFd` first (`net.close` does).  A no-op on other platforms.
+  when defined(linux):
+    let s {.cursor.} = sched()
+    s.fds[fd] = FdWait(persistent: true)      # also resets state left by a closed fd of the same number
+  else:
+    discard
+
+proc forgetFd*(fd: int) =
+  ## drop the bookkeeping for a watched fd; call before closing it
+  when defined(linux):
+    let s {.cursor.} = sched()
+    if fd in s.fds and s.fds[fd].persistent:
+      let st = s.fds[fd]
+      if st.rd != nil: dec s.fdWaiting
+      if st.wr != nil: dec s.fdWaiting
+      s.fds.del fd
+  else:
+    discard
+
 proc syncFd(s: Scheduler, fd: int, st: FdWait) =
   let want = st.evs
   if want == {}:
@@ -588,28 +873,43 @@ proc dropFdWaiter(fd: int, write: bool) =
   if fd in s.fds:
     let st = s.fds[fd]
     if write:
-      if st.wr != nil: dec s.fdWaiting
+      if st.wr != nil:
+        dec s.fdWaiting
+        if not st.persistent: dec s.npWait
       st.wr = nil; st.evs.excl Event.Write
     else:
-      if st.rd != nil: dec s.fdWaiting
+      if st.rd != nil:
+        dec s.fdWaiting
+        if not st.persistent: dec s.npWait
       st.rd = nil; st.evs.excl Event.Read
-    s.syncFd(fd, st)
+    if not st.persistent: s.syncFd(fd, st)
 
 proc ioHook(c: Frame, fd: int, write: bool): Hop =
   cancelGuard(c)
   let p = cast[pointer](c)
   let s {.cursor.} = sched()
-  if s.sel == nil: s.sel = newSelector[int]()
+  s.ensureSel()
   let st = s.fds.mgetOrPut(fd, FdWait())
   if (write and st.wr != nil) or (not write and st.rd != nil):
     c.ex = newException(IOError, "another task already waits on this fd")
     return step(p)
+  when defined(linux):
+    if st.persistent:
+      # an edge already arrived while nobody waited: the caller retries its syscall
+      if write and st.wrReady: (st.wrReady = false; return step(p))
+      if not write and st.rdReady: (st.rdReady = false; return step(p))
+      if not st.registered:
+        s.pepRegister(fd)
+        st.registered = true
   let t = c.task
   if t != nil:
-    t.parked = p; t.parkKind = pkFd; t.parkFd = int32(fd); t.parkWrite = write
+    t.parked = p; t.parkKind = pkFd; t.parkRef = cast[pointer](fd); t.parkWrite = write
   if write: (st.wr = p; st.evs.incl Event.Write)
   else: (st.rd = p; st.evs.incl Event.Read)
   inc s.fdWaiting
+  if st.persistent:
+    return noStep               # already registered with the kernel: no syscall at all
+  inc s.npWait
   s.syncFd(fd, st)
   noStep
 
@@ -634,35 +934,67 @@ proc waitWritable*(fd: int) {.flowCtor: writeCtor, inlineSuspend: writeHook.} =
   blockOn(writeCtor(fd))
 
 proc pollIo(s: Scheduler, timeoutMs: int) =
+  var tmo = timeoutMs
+  when defined(linux):
+    if s.ring != nil:
+      if s.sel == nil:
+        # ring-only loop: ONE syscall submits what was queued, waits (bounded by the
+        # next timer) and then the completions are read from shared memory
+        if tmo == 0: discard s.ring.submit()
+        else: discard s.ring.submit(wait = true,
+                                    waitNs = if tmo < 0: -1'i64 else: int64(tmo) * 1_000_000'i64)
+        discard s.ringReap()
+        return
+      discard s.ring.submit()                  # hand over queued operations (no waiting)
+      if s.ringReap() > 0: tmo = 0             # something finished already: do not block
   if s.sel == nil: return
-  let evs = s.sel.select(timeoutMs)
+  when defined(linux):
+    if tmo == 0 and s.npWait == 0 and s.pepOn:
+      s.pepHarvest()            # only watched fds: one epoll_wait, no selector round trip
+      return
+  let evs = s.sel.select(tmo)
   for k in evs:
     let fd = k.fd
+    when defined(linux):
+      if s.ring != nil and fd == int(s.ring.fd):
+        discard s.ringReap()
+        continue
+      if s.pepOn and fd == int(s.pepFd):
+        s.pepHarvest()
+        continue
     if fd notin s.fds: continue
     let st = s.fds[fd]
+    if st.persistent: continue
     let bad = Event.Error in k.events
     if (Event.Read in k.events or bad or Event.User in k.events) and st.rd != nil:
       let leaf = st.rd
-      st.rd = nil; st.evs.excl Event.Read; dec s.fdWaiting
+      st.rd = nil; st.evs.excl Event.Read; dec s.fdWaiting; dec s.npWait
       wake(leaf)
     if (Event.Write in k.events or bad) and st.wr != nil:
       let leaf = st.wr
-      st.wr = nil; st.evs.excl Event.Write; dec s.fdWaiting
+      st.wr = nil; st.evs.excl Event.Write; dec s.fdWaiting; dec s.npWait
       wake(leaf)
     s.syncFd(fd, st)
 
 # --- tasks -----------------------------------------------------------------
 
-proc finishTask(t: TaskBase, st: TaskState, err: ref Exception) =
-  var dq: WaitQueue = nil
-  tlock t:
-    t.err = err
-    t.state = st
-    dq = t.doneq                      # waiters that parked before this point are in it
+proc finishTask(t: TaskBase, st: TaskState) =
+  ## publish the outcome of `t` (its exception, if any, is already in `t.ex`)
+  publishState(t, st)
   t.parked = nil
   t.parkKind = pkNone
   dec sched().live
-  if dq != nil: notifyAll(dq)
+  when flowThreads:
+    if t.counted:
+      let sh = sched().shared
+      atomicStoreN(addr sh.done, sh.done + 1, ATOMIC_RELAXED)
+    # waiters that published their queue before this point are in it; later ones saw `state`
+    let dqp = atomicLoadN(cast[ptr pointer](addr t.doneq), ATOMIC_SEQ_CST)
+    if dqp != nil:
+      let dq {.cursor.} = cast[WaitQueue](dqp)
+      notifyAll(dq)
+  else:
+    if t.doneq != nil: notifyAll(t.doneq)
   if t.grp != nil:
     let g = t.grp
     t.grp = nil                       # break the scope <-> task cycle
@@ -672,10 +1004,9 @@ proc finishTask(t: TaskBase, st: TaskState, err: ref Exception) =
 proc completerStage(p: pointer): Hop =
   let t = cast[TaskBase](p)
   if t.ex != nil:
-    let e = popEx(t)
-    finishTask(t, (if e of CancelledError: tsCancelled else: tsFailed), e)
+    finishTask(t, (if t.ex of CancelledError: tsCancelled else: tsFailed))
   else:
-    finishTask(t, tsDone, nil)
+    finishTask(t, tsDone)
   release(p)                  # the pin taken at launch; handles keep the task alive
   noStep
 
@@ -696,9 +1027,14 @@ proc launch*(c: sink Frame, t: TaskBase) =
   schedule(p)
 
 when flowThreads:
-  proc launchOn*(c: sink Frame, t: TaskBase, target: ptr SchedShared) =
+  proc launchOn*(c: sink Frame, t: TaskBase, target: ptr SchedShared, counted = false) =
+    ## start `c` as task `t` on the scheduler behind `target`; `counted`: it takes part in
+    ## that worker's load (`posted` / `done`)
     let p = prepareLaunch(c, t)
     t.sched = cast[pointer](target)
+    if counted:
+      t.counted = true
+      discard target.posted.fetchAdd(1, moRelaxed)
     post(target, p)
 
 proc goImpl*[R](c: sink Frame, _: typedesc[R]): Task[R] =
@@ -753,7 +1089,7 @@ macro prepare*(call: typed): untyped =
   result = c
 
 proc cancelLocal(t: TaskBase) =
-  if t.state != tsPending or t.cancelRequested: return
+  if stateOf(t) != tsPending or t.cancelRequested: return
   t.cancelRequested = true
   if t.parked != nil:
     let leaf = t.parked           # we take over its pin
@@ -761,7 +1097,7 @@ proc cancelLocal(t: TaskBase) =
     let kind = t.parkKind
     t.parkKind = pkNone
     case kind
-    of pkQueue: discard removeWaiter(cast[WaitQueue](t.parkQ), leaf)
+    of pkQueue: discard removeWaiter(cast[WaitQueue](t.parkRef), leaf)
     of pkAny:
       let st = cast[AnyState](t.parkRef)
       st.fired = true
@@ -769,7 +1105,13 @@ proc cancelLocal(t: TaskBase) =
       st.qs = @[]
       st.target = nil
     of pkTimer: cancel(cast[Timer](t.parkRef))
-    of pkFd: dropFdWaiter(int(t.parkFd), t.parkWrite)
+    of pkFd: dropFdWaiter(cast[int](t.parkRef), t.parkWrite)
+    of pkRing:
+      when defined(linux):
+        # keep the continuation parked: it resumes (cancelled) when the kernel is done
+        t.parked = leaf; t.parkKind = pkRing
+        ringCancel(cast[RingOp](t.parkRef))
+      return
     of pkNone: discard
     envOf(leaf).ex = newCancelled()
     schedule(leaf)
@@ -785,7 +1127,7 @@ when flowThreads:
 proc cancel*(t: TaskBase) =
   ## request cancellation; the task sees `CancelledError` at its next
   ## suspension point (or `checkpoint()`). Safe to call from any thread.
-  if t.state != tsPending: return
+  if stateOf(t) != tsPending: return
   when flowThreads:
     if t.sched != nil and t.sched != cast[pointer](sched().shared):
       post(cast[ptr SchedShared](t.sched),
@@ -793,29 +1135,45 @@ proc cancel*(t: TaskBase) =
       return
   cancelLocal(t)
 
-proc done*(t: TaskBase): bool = t.state != tsPending
-proc failed*(t: TaskBase): bool = t.state == tsFailed
-proc cancelled*(t: TaskBase): bool = t.state == tsCancelled
+proc done*(t: TaskBase): bool = stateOf(t) != tsPending
+proc failed*(t: TaskBase): bool = stateOf(t) == tsFailed
+proc cancelled*(t: TaskBase): bool = stateOf(t) == tsCancelled
 
 proc waitDone*(t: TaskBase) {.flow.} =
   ## suspend until `t` finished (does not raise)
-  while t.state == tsPending:
+  while stateOf(t) == tsPending:
     parkPending(t)
 
 proc getValue*[T](t: Task[T]): T =
   t.observed = true
-  case t.state
+  case stateOf(t)
   of tsDone:
     when T isnot void: result = t.value
   of tsPending: raise newException(ValueError, "task not finished")
   else: raise t.err
 
-template await*[T](t: Task[T]): T =
+macro await*(t: typed): untyped =
   ## wait for a task and return its value (re-raising its exception)
-  block:
-    let flowT = t
-    while flowT.state == tsPending: parkPending(flowT)
-    getValue(flowT)
+  ##
+  ## A handle held in an immutable variable (`let`, a parameter, a `for` variable) is used
+  ## in place; any other expression is evaluated once into a local first.  (Copying a
+  ## handle costs an atomic reference count increment and decrement under `atomicArc`.)
+  var a = t
+  while a.kind in {nnkHiddenStdConv, nnkHiddenSubConv, nnkHiddenDeref}: a = a[^1]
+  let stable = a.kind == nnkSym and a.symKind in {nskLet, nskForVar, nskParam} and
+               a.getTypeInst.kind != nnkVarTy
+  if stable:
+    result = quote do:
+      block:
+        while stateOf(`a`) == tsPending: parkPending(`a`)
+        getValue(`a`)
+  else:
+    let ft = genSym(nskLet, "flowT")
+    result = quote do:
+      block:
+        let `ft` = `t`
+        while stateOf(`ft`) == tsPending: parkPending(`ft`)
+        getValue(`ft`)
 
 # --- event loop -------------------------------------------------------------
 
@@ -827,7 +1185,7 @@ proc runLoop*(until: TaskBase = nil, forever = false) =
     when flowThreads:
       drainInbox(s)
       if forever and s.shared.stopping.load: break
-    if until != nil and until.state != tsPending: break
+    if until != nil and stateOf(until) != tsPending: break
     if s.wheel.live > 0:
       wheelAdvance(s.wheel, nowMs())
     if s.ready.len > 0:
@@ -876,12 +1234,13 @@ proc runLoop*(until: TaskBase = nil, forever = false) =
         if wait > 0: os.sleep(wait)
         continue
       break
-  if until != nil and until.state == tsPending and not forever:
+  if until != nil and stateOf(until) == tsPending and not forever:
     let what = case until.parkKind
       of pkQueue: "a channel / lock / event that nothing can ever signal"
       of pkAny: "several events (select / any) none of which can fire"
       of pkTimer: "a timer"
       of pkFd: "a file descriptor"
+      of pkRing: "an io_uring operation"
       of pkNone: "nothing (it was never resumed)"
     raise newException(DeadlockError,
       "event loop ran out of work but the awaited task is still pending: it is parked on " &
@@ -894,7 +1253,8 @@ when flowThreads:
     ## (other threads may still be inside `post`/`trigger` until then)
     sh.wake.close()
     release(sh.stub)
-    deallocShared(sh)
+    release(sh.spawnSink)
+    deallocShared(sh.rawBase)
 
   proc releaseSched*(keepShared = false) =
     ## free the scheduler of the calling (worker) thread; called on thread exit.
@@ -903,7 +1263,9 @@ when flowThreads:
     drainPools()
     if theSched == nil: return
     let sh = theSched.shared
-    theSched.sel.close()
+    when defined(linux):
+      if theSched.ring != nil: theSched.ring.close()
+    if theSched.sel != nil: theSched.sel.close()
     theSched = nil
     if not keepShared: freeShared(sh)
 
@@ -913,7 +1275,7 @@ proc syncRun(c: sink Frame) {.nimcall.} =
   let t = TaskBase()
   launch(c, t)
   runLoop(t)
-  if t.state == tsFailed or t.state == tsCancelled: raise t.err
+  if stateOf(t) == tsFailed or stateOf(t) == tsCancelled: raise t.err
 
 syncDriver = syncRun
 
@@ -951,24 +1313,24 @@ proc prune(g: Scope) =
   ## closes (a scope that spawns a million short tasks holds a million objects)
   var j = 0
   for i in 0..<g.tasks.len:
-    if g.tasks[i].state != tsDone:
+    if stateOf(g.tasks[i]) != tsDone:
       if i != j: g.tasks[j] = move g.tasks[i]
       inc j
   g.tasks.setLen(j)
   g.pruneAt = max(256, 2 * j)
 
 proc add*(g: Scope, t: TaskBase) =
-  if t.state == tsDone: return         # finished already (see `goInline`): nothing to track
+  if stateOf(t) == tsDone: return         # finished already (see `goInline`): nothing to track
   if g.tasks.len >= g.pruneAt and not g.joining: prune(g)
   g.tasks.add t
-  if t.state == tsPending:
+  if stateOf(t) == tsPending:
     # a child that finishes on this thread reports to the scope directly; one that
     # lives on another thread is simply waited for in order (see `join`)
     when flowThreads:
       if t.sched == cast[pointer](sched().shared): t.grp = g
     else:
       t.grp = g
-  elif t.state == tsFailed and g.failed == nil:
+  elif stateOf(t) == tsFailed and g.failed == nil:
     g.failed = t
 
 proc cancel*(g: Scope) =
@@ -1002,7 +1364,7 @@ proc join*(g: Scope) {.flow.} =
     let t = g.tasks[i]
     try:
       if err == nil:
-        while t.state == tsPending and g.failed == nil:
+        while stateOf(t) == tsPending and g.failed == nil:
           park(g.ev)
       else:
         waitDone(t)
@@ -1015,7 +1377,7 @@ proc join*(g: Scope) {.flow.} =
       g.failed.observed = true
       g.cancel()
       continue                        # now wait for `t` to stop as well
-    if t.state == tsPending: continue # a child on another thread: keep waiting
+    if stateOf(t) == tsPending: continue # a child on another thread: keep waiting
     inc i
   if err != nil: raise err
 
@@ -1047,20 +1409,19 @@ proc startTimeout*(ms: int, q: WaitQueue): TimeoutFlag =
   f
 
 proc doneQueue*(t: TaskBase): WaitQueue =
-  tlock t:
-    if t.doneq == nil: t.doneq = newWaitQueue()
-    result = t.doneq
+  result = cast[WaitQueue](ensureDoneqP(t))
 
 proc waitFor*(t: TaskBase, ms: int): bool {.flow.} =
   ## wait up to `ms` milliseconds for `t`; returns whether it finished
   let q = t.doneQueue
   let flag = startTimeout(ms, q)
   try:
-    while t.state == tsPending and not flag.fired:
-      park(q)
+    while stateOf(t) == tsPending and not flag.fired:
+      let e = epochOf(q)                       # a completion bumps the epoch: no lost wake-up
+      if stateOf(t) == tsPending and not flag.fired: parkSince(q, e)
   finally:
     cancel(flag.timer)
-  result = t.state != tsPending
+  result = stateOf(t) != tsPending
 
 template withTimeout*(ms: int, call: untyped): untyped =
   ## run `call` (a flow call) as a task and cancel it after `ms` milliseconds,

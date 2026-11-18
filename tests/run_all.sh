@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 fail=0
 for mm in arc orc; do
   for f in t_*.nim; do
-    case $f in t_leak.nim|t_loop1.nim|t_mt.nim|t_fastmt.nim) continue;; esac
+    case $f in t_leak.nim|t_loop1.nim|t_mt.nim|t_fastmt.nim|t_balance.nim) continue;; esac
     out=$(nim c --mm:$mm --hints:off --warningAsError:Deprecated --warningAsError:UnusedImport \
        --passC:-fsanitize=address --passL:-fsanitize=address \
       -d:useMalloc "$@" -r $f 2>&1)
@@ -29,7 +29,7 @@ else echo "FAIL [example] offload"; fail=1; fi
 # every code block in the docs must compile and run
 if sh ./docs_check.sh >/dev/null 2>&1; then echo "pass [docs] all code blocks"; else echo "FAIL [docs]"; fail=1; fi
 # multi-threaded build
-for f in t_mt.nim t_fastmt.nim; do
+for f in t_mt.nim t_fastmt.nim t_balance.nim; do
   out=$(nim c --threads:on --mm:atomicArc -d:flowThreads --hints:off --warningAsError:Deprecated \
      --passC:-fsanitize=address --passL:-fsanitize=address \
     -d:useMalloc -r $f 2>&1 | grep -v "LeakSanitizer\|^    #\|SUMMARY\|^$\|leak of\|Direct leak\|Indirect leak")
@@ -37,4 +37,18 @@ for f in t_mt.nim t_fastmt.nim; do
     echo "FAIL [atomicArc+threads] $f"; echo "$out" | tail; fail=1
   else echo "pass [atomicArc+threads] $f"; fi
 done
+# the network tests again, this time through io_uring (they skip themselves where it is unavailable)
+if [ "$(uname)" = Linux ]; then
+  for mm in arc orc; do
+    out=$(nim c --mm:$mm -d:useRing --hints:off --warningAsError:Deprecated \
+       --passC:-fsanitize=address --passL:-fsanitize=address -d:useMalloc -r t_netfast.nim 2>&1)
+    if echo "$out" | grep -qE "FAIL|Error|AddressSanitizer|Traceback|Warning"; then
+      echo "FAIL [$mm io_uring] t_netfast.nim"; echo "$out" | tail -15; fail=1
+    else echo "pass [$mm io_uring] t_netfast.nim"; fi
+  done
+  out=$(nim c --threads:on --mm:atomicArc -d:flowThreads --hints:off --warningAsError:Deprecated -r t_uring.nim 2>&1)
+  if echo "$out" | grep -qE "FAIL|Error|Traceback|Assertion|Warning"; then
+    echo "FAIL [atomicArc+threads] t_uring.nim"; echo "$out" | tail; fail=1
+  else echo "pass [atomicArc+threads] t_uring.nim"; fi
+fi
 exit $fail

@@ -6,16 +6,25 @@ library behaves differently because of it.
 
 ## What was verified, and how
 
-The test-suite and most demos were ran under windows pc and all tests passed:
+The test-suite and most demos were cross-compiled with MinGW-w64 on Linux and executed as
+real Windows binaries under Wine, in both configurations:
 
 | configuration | flags | result |
 |---|---|---|
 | single thread | `--mm:arc` | all `tests/t_*.nim` pass, including `t_net` (real Winsock sockets) |
 | threads | `--threads:on --mm:atomicArc -d:flowThreads` | `t_mt`, `t_fastmt` pass |
-| demos | as in `demos/run_all.sh` | all passed |
+| sockets | `--mm:arc` | `t_netfast` (idle waits, 8 MB transfer with backpressure, 3000 fd-reusing connections, EOF, cancel, connect refused, `serveTcp`) passes |
+| demos | as in `demos/run_all.sh` | d01-d11 and d15-d19 pass |
 
 Not verified:
-* address/thread sanitizers.
+
+* a native (non-Wine) Windows run of the whole suite;
+* demos d12, d13, d14 (many sockets) and d20 (threads): under Wine they did not finish
+  (d12/d13 timed out, d14 hit the descriptor limit before it was raised, and a later
+  retry of d12/d20 hung the Wine process itself). Whether that is Wine, the 64-socket
+  default, or a real problem on Windows was not determined, so treat these four as
+  untested on Windows;
+* address/thread sanitizers (MinGW gcc has neither).
 
 If something fails on your machine, please report the Nim version and the first error
 line.
@@ -33,6 +42,13 @@ nim c -d:release --threads:on --mm:atomicArc -d:flowThreads app.nim :: with stag
 with AddressSanitizer/ThreadSanitizer, which MinGW does not provide; on Windows run the
 tests directly with `nim c -r`, and `sh demos/run_all.sh` for the demos.
 
+Cross-compiling from Linux (what the checks above used):
+
+```
+nim c --os:windows --cpu:amd64 --gcc.exe:x86_64-w64-mingw32-gcc \
+      --gcc.linkerexe:x86_64-w64-mingw32-gcc --mm:arc -o:app.exe app.nim
+wine app.exe
+```
 
 ## What is different from Linux
 
@@ -55,8 +71,19 @@ tests directly with `nim c -r`, and `sh demos/run_all.sh` for the demos.
 * **Threads.** Cross-thread wake-ups use Nim's `SelectEvent` (a loopback socket pair on
   Windows). A thread that has run out of work yields with `SwitchToThread` before it
   sleeps (`sched_yield` on POSIX).
+* **Failed connects.** Winsock reports a failed non-blocking `connect` only in the
+  exception set of `select()`, which Nim's selector does not look at; `connectTcp` polls the
+  outcome itself (zero-timeout `select`, 1 ms between polls) so a refused connection raises
+  instead of waiting forever.
 * **Errors.** `stagelane/net` reads `WSAGetLastError` instead of `errno`; `WSAEWOULDBLOCK`
   covers both "would block" and "connect in progress".
+
+## Linux-only features
+
+`ringEnable()` (io_uring) and the persistent, edge-triggered socket registration are Linux
+only. On Windows and macOS `ringEnable()` returns `false`, `watchFd`/`forgetFd` do nothing,
+and `stagelane/net` uses the same readiness path as before; code written against
+`stagelane/uring` still compiles and runs, it just stays on the portable path.
 
 ## Files that touch the platform
 

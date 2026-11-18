@@ -42,7 +42,7 @@ run main()
 
 | | |
 |---|---|
-| [docs/guide.md](docs/guide.md) | learn it step by step (10 minutes) |
+| [docs/guide.md](docs/guide.md) | learn it step by step (30 minutes) |
 | [docs/why.md](docs/why.md) | what problem it solves, colour problem, comparison with asyncdispatch |
 | [docs/recipes.md](docs/recipes.md) | worker pools, retries, rate limits, graceful shutdown |
 | [docs/internals.md](docs/internals.md) | how it works, if you are curious or contributing |
@@ -52,5 +52,5 @@ run main()
 
 ## Status
 
-Version 0.2. Solid core, tested under sanitizers on Linux.
-Known gaps: flow procs cannot be stored in `proc` variables. See [limits](docs/guide.md#limits).
+Version 0.1. Solid core, tested under sanitizers on Linux. Known gaps: no work stealing between pool workers,
+no nested or anonymous flow procs. See [limits](docs/guide.md#limits).

@@ -52,3 +52,18 @@ bench/compare/*
 bench/compare/go/*
 !bench/compare/go/*.go
 !bench/compare/go/go.mod
+
+# bench/http: sources, scripts and READMEs are kept; builds are not
+!bench/http/
+bench/http/*
+!bench/http/*.nim
+!bench/http/*.sh
+!bench/http/*.md
+!bench/http/loadgen/
+bench/http/loadgen/*
+!bench/http/loadgen/*.go
+!bench/http/loadgen/go.mod
+!bench/http/gohttp/
+bench/http/gohttp/*
+!bench/http/gohttp/*.go
+!bench/http/gohttp/go.mod

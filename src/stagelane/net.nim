@@ -4,7 +4,8 @@ when defined(windows):
   import std/winlean
 else:
   import std/posix
-import ./core, ./transform, ./sched
+import std/macros
+import ./core, ./transform, ./sched, ./uring, ./flowfn
 
 # --- the few socket calls that differ between Winsock and POSIX ---------------
 when defined(windows):
@@ -30,6 +31,17 @@ when defined(windows):
     discard winlean.getsockopt(fd, SOL_SOCKET, SO_ERROR, cast[cstring](addr err), addr len)
     int(err)
   proc netToHostPort(p: uint16): int {.inline.} = int(nativesockets.ntohs(p))
+  proc winConnectState(fd: SocketHandle): int =
+    ## 0 = still connecting, 1 = connected, 2 = failed (zero-timeout select incl. exceptfds)
+    var wset, eset: TFdSet
+    FD_ZERO(wset); FD_ZERO(eset)
+    FD_SET(fd, wset); FD_SET(fd, eset)
+    var tv = Timeval(tv_sec: 0, tv_usec: 0)
+    let n = winlean.select(cint(1), nil, addr wset, addr eset, addr tv)
+    if n <= 0: return 0
+    if FD_ISSET(fd, eset) != 0: return 2
+    if FD_ISSET(fd, wset) != 0: return 1
+    0
 else:
   proc lastNetError(): int {.inline.} = int(errno)
   proc errWouldBlock(e: int): bool {.inline.} = e == int(EAGAIN) or e == int(EWOULDBLOCK) or e == int(EINTR)
@@ -55,9 +67,11 @@ type
   TcpStream* = ref object
     fd*: SocketHandle
     closed: bool
+    drained: bool       # Linux: the last read emptied the socket; wait for the next edge before reading
     rbuf: string
   TcpListener* = ref object
     fd*: SocketHandle
+    ringReady: bool     # Linux/io_uring: switched to blocking mode for ring accepts
 
 proc setNonBlock(fd: SocketHandle) = fd.setBlocking(false)
 
@@ -82,6 +96,7 @@ proc listenTcp*(port: int, host = "0.0.0.0", backlog = 128): TcpListener =
   freeAddrInfo(ai)
   if sockListen(fd, backlog) < 0: raiseOSError(osLastError())
   setNonBlock(fd)
+  watchFd(int(fd))
   TcpListener(fd: fd)
 
 proc localPort*(l: TcpListener): int =
@@ -90,21 +105,33 @@ proc localPort*(l: TcpListener): int =
   discard sockName(l.fd, cast[ptr SockAddr](addr sa), addr len)
   netToHostPort(sa.sin_port.uint16)
 
-proc close*(l: TcpListener) = close(l.fd)
+proc close*(l: TcpListener) =
+  forgetFd(int(l.fd))
+  close(l.fd)
 
 proc close*(s: TcpStream) =
   if not s.closed:
     s.closed = true
+    forgetFd(int(s.fd))
     close(s.fd)
 
 proc accept*(l: TcpListener): TcpStream {.flow.} =
   ## wait for and accept a connection
+  when defined(linux):
+    if ringActive():
+      if not l.ringReady:
+        l.fd.setBlocking(true)          # io_uring waits for us; a non-blocking fd would answer EAGAIN
+        l.ringReady = true
+      let r = ringAccept(int(l.fd))
+      if r < 0: raiseOSError(OSErrorCode(-r))
+      return TcpStream(fd: SocketHandle(r))   # accepted sockets start out blocking
   while true:
     var sa: Sockaddr_in
     var len = SockLen(sizeof(sa))
     let fd = sockAccept(l.fd, cast[ptr SockAddr](addr sa), addr len)
     if fd != osInvalidSocket:
       setNonBlock(fd)
+      watchFd(int(fd))
       return TcpStream(fd: fd)
     if not wouldBlock(): raiseOSError(osLastError())
     waitReadable(int(l.fd))
@@ -113,6 +140,14 @@ proc connectTcp*(host: string, port: int): TcpStream {.flow.} =
   ## connect to `host:port`
   let fd = newTcpSocket()
   if fd == osInvalidSocket: raiseOSError(osLastError())
+  when defined(linux):
+    if ringActive():
+      var rai = resolve(host, port)
+      let rr = ringConnect(int(fd), rai.ai_addr, int(rai.ai_addrlen))   # blocking-mode socket
+      freeAddrInfo(rai)
+      if rr < 0:
+        close(fd); raiseOSError(OSErrorCode(-rr))
+      return TcpStream(fd: fd)
   setNonBlock(fd)
   var ai = resolve(host, port)
   let r = sockConnect(fd, ai.ai_addr, ai.ai_addrlen.SockLen)
@@ -121,10 +156,19 @@ proc connectTcp*(host: string, port: int): TcpStream {.flow.} =
   if r < 0 and not errInProgress(e):
     close(fd); raiseOSError(OSErrorCode(e))
   if r < 0:
-    waitWritable(int(fd))
+    when defined(windows):
+      # Winsock reports a *failed* non-blocking connect only in select()'s exception
+      # set, which Nim's selector never looks at: poll the outcome ourselves
+      while true:
+        let st = winConnectState(fd)
+        if st != 0: break
+        delay(1)
+    else:
+      waitWritable(int(fd))
     let err = sockPendingError(fd)
     if err != 0:
       close(fd); raiseOSError(OSErrorCode(err))
+  watchFd(int(fd))
   return TcpStream(fd: fd)
 
 proc readSome*(s: TcpStream, n: int = 4096): string {.flow.} =
@@ -135,13 +179,26 @@ proc readSome*(s: TcpStream, n: int = 4096): string {.flow.} =
     s.rbuf = s.rbuf[k..^1]
     return
   var buf = newString(n)
+  when defined(linux):
+    if ringActive():
+      let rr = ringRecv(int(s.fd), addr buf[0], n)
+      if rr < 0: raiseOSError(OSErrorCode(-rr))
+      buf.setLen(rr)
+      return buf
   while true:
+    when defined(linux):
+      if s.drained:                    # known empty: skip the probing recv that would only say EAGAIN
+        waitReadable(int(s.fd))
+        s.drained = false
     let r = sockRecv(s.fd, addr buf[0], n)
     if r >= 0:
+      when defined(linux):
+        if r > 0 and r < n: s.drained = true     # a short read means the socket is empty now
       buf.setLen(r)
       return buf
     if not wouldBlock(): raiseOSError(osLastError())
-    waitReadable(int(s.fd))
+    when defined(linux): s.drained = true
+    else: waitReadable(int(s.fd))
 
 proc readLine*(s: TcpStream): string {.flow.} =
   ## read up to and excluding "\n" ("\r\n" tolerated); "" + EOF -> raises IOError
@@ -155,10 +212,24 @@ proc readLine*(s: TcpStream): string {.flow.} =
     var buf = newString(4096)
     var got = -1
     while got < 0:
+      when defined(linux):
+        if ringActive():
+          let rr = ringRecv(int(s.fd), addr buf[0], 4096)
+          if rr < 0: raiseOSError(OSErrorCode(-rr))
+          got = rr
+          continue
+        if s.drained:
+          waitReadable(int(s.fd))
+          s.drained = false
       let r = sockRecv(s.fd, addr buf[0], 4096)
-      if r >= 0: got = r
+      if r >= 0:
+        got = r
+        when defined(linux):
+          if r > 0 and r < 4096: s.drained = true
       elif not wouldBlock(): raiseOSError(osLastError())
-      else: waitReadable(int(s.fd))
+      else:
+        when defined(linux): s.drained = true
+        else: waitReadable(int(s.fd))
     if got == 0:
       if s.rbuf.len > 0:
         result = s.rbuf; s.rbuf = ""; return
@@ -170,7 +241,93 @@ proc write*(s: TcpStream, data: string) {.flow.} =
   ## write all of `data`
   var off = 0
   while off < data.len:
+    when defined(linux):
+      if ringActive():
+        let rr = ringSend(int(s.fd), unsafeAddr data[off], data.len - off)
+        if rr < 0: raiseOSError(OSErrorCode(-rr))
+        off += rr
+        continue
     let r = sockSend(s.fd, unsafeAddr data[off], data.len - off)
     if r >= 0: off += r
     elif wouldBlock(): waitWritable(int(s.fd))
     else: raiseOSError(osLastError())
+
+# --- zero-copy primitives: caller-owned memory, no allocation ------------------
+
+proc recvInto*(s: TcpStream, buf: pointer, n: int): int {.flow.} =
+  ## read up to `n` bytes into `buf`; returns 0 at end of stream.  Unlike `readSome`
+  ## this allocates nothing: the caller owns (and reuses) the buffer.
+  if s.rbuf.len > 0:
+    let k = min(n, s.rbuf.len)
+    copyMem(buf, unsafeAddr s.rbuf[0], k)
+    s.rbuf = s.rbuf[k..^1]
+    return k
+  when defined(linux):
+    if ringActive():
+      let rr = ringRecv(int(s.fd), buf, n)
+      if rr < 0: raiseOSError(OSErrorCode(-rr))
+      return rr
+  while true:
+    when defined(linux):
+      if s.drained:
+        waitReadable(int(s.fd))
+        s.drained = false
+    let r = sockRecv(s.fd, buf, n)
+    if r >= 0:
+      when defined(linux):
+        if r > 0 and r < n: s.drained = true
+      return r
+    if not wouldBlock(): raiseOSError(osLastError())
+    when defined(linux): s.drained = true
+    else: waitReadable(int(s.fd))
+
+proc sendFrom*(s: TcpStream, buf: pointer, n: int) {.flow.} =
+  ## write all `n` bytes at `buf` (the memory must stay valid until this returns)
+  var off = 0
+  while off < n:
+    when defined(linux):
+      if ringActive():
+        let rr = ringSend(int(s.fd), cast[pointer](cast[uint](buf) + uint(off)), n - off)
+        if rr < 0: raiseOSError(OSErrorCode(-rr))
+        off += rr
+        continue
+    let r = sockSend(s.fd, cast[pointer](cast[uint](buf) + uint(off)), n - off)
+    if r >= 0: off += r
+    elif wouldBlock(): waitWritable(int(s.fd))
+    else: raiseOSError(osLastError())
+
+# --- handlers by name ----------------------------------------------------------------
+
+macro serveTcp*(l: untyped, handler: untyped, ctx: varargs[untyped]): untyped =
+  ## Accept connections forever and run `handler(ctx..., conn)` as one task per connection.
+  ## `handler` is the *name* of a `{.flow.}` proc whose last parameter is the `TcpStream`, so
+  ## it may pause (`delay`, channels, other sockets, ...) even though flow procs cannot be stored
+  ## in `proc` variables: the call is resolved at compile time.  Call it from a flow proc.
+  ##
+  ## `ctx` carries what the handler needs besides the connection (a server object, a
+  ## config, a channel...): each is evaluated once, before the first accept, and passed in
+  ## front of the connection, so `serveTcp(l, handle, app, limits)` runs `handle(app, limits, conn)`.
+  ## (A `ref` object is shared by all connections; other values are copied into each task.)
+  let lis = genSym(nskLet, "flowListener")
+  let conn = genSym(nskLet, "flowConn")
+  var lets = newStmtList()
+  lets.add newLetStmt(lis, l)
+  let call = newCall(handler)
+  for c in ctx:
+    let v = genSym(nskLet, "flowCtx")
+    lets.add newLetStmt(v, c)
+    call.add v
+  call.add conn
+  result = lets
+  result.add quote do:
+    while true:
+      let `conn` = `lis`.accept()
+      discard go `call`
+  result = newBlockStmt(result)
+
+proc serveTcp*(l: TcpListener, handler: FlowFn[proc (c: TcpStream)]) {.flow.} =
+  ## Like the template above for a handler held in a value (`flowFn(myHandler)`), so a
+  ## server can be written once and given its handler, or pick it from a table.
+  while true:
+    let conn = l.accept()
+    discard go handler.call(conn)

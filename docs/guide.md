@@ -231,6 +231,68 @@ run main()
 One task per connection is just a couple of small heap objects. Reading and writing
 pause only when the socket is not ready.
 
+### Fast servers
+
+Three things matter when a server handles many connections:
+
+* **Sockets stay registered.** On Linux, sockets from `stagelane/net` are registered with
+  the kernel once (edge-triggered) instead of once per pause, and a read that is known to
+  have emptied the socket does not probe it again. An idle keep-alive request costs 2
+  syscalls (`recv`, `send`) instead of 5. Nothing to do; it is on by default.
+* **No allocation per read.** `readSome` returns a new string. `recvInto(buf, n)` and
+  `sendFrom(buf, n)` use memory you own and reuse.
+* **Handlers and receivers.** `serveTcp(listener, handler, ctx...)` runs `handler(ctx..., conn)`
+  per connection: extra arguments (a server object, a config) are evaluated once and passed in
+  front of the connection; a `ref` is shared by all connections. `serveTcp(listener, handler)` takes the *name* of a flow proc, resolved at
+  compile time, or a flow proc held in a value (`flowFn(handler)`, see
+  [flow procs as values](#flow-procs-as-values)); either way the handler may pause like any
+  flow proc (`delay`, channels, other sockets).
+
+```nim
+import stagelane, stagelane/net, stagelane/uring
+
+discard ringEnable()          # io_uring where the kernel has it; a no-op returning false elsewhere
+
+proc echoOnce(c: TcpStream) {.flow.} =
+  var buf = newString(256)
+  let n = c.recvInto(addr buf[0], buf.len)
+  if n > 0: c.sendFrom(addr buf[0], n)
+  c.close()
+
+proc server(l: TcpListener) {.flow.} = serveTcp(l, echoOnce)
+
+proc client(port: int): string {.flow.} =
+  let s = connectTcp("127.0.0.1", port)
+  s.write("fast")
+  result = s.readSome(16)
+  s.close()
+
+proc main() {.flow.} =
+  let l = listenTcp(0, "127.0.0.1")
+  scope g:
+    let srv = go(g, server(l))
+    echo await(go(g, client(l.localPort)))      # fast
+    srv.cancel()                                # the accept loop never ends by itself
+  l.close()
+
+run main()
+```
+
+**io_uring (Linux 5.11+, opt-in).** `ringEnable()` (once per thread, before the first
+I/O) switches `stagelane/net` to completion-based I/O: every operation a loop turn produces
+goes to the kernel in one `io_uring_enter`, and the results are read back from shared
+memory. On the HTTP benchmark that is 0.2 syscalls per request instead of 2. Whether it
+also saves CPU depends on what a syscall costs where you deploy: on a loopback test in a
+VM the kernel's TCP work dominates and CPU per request is about equal; with mitigations,
+sandboxes or many connections per loop turn the saving grows. `ringEnable()` returns
+`false` and changes nothing if the kernel cannot do it, so the same code runs everywhere.
+
+`stagelane/uring` also exposes the operations themselves: `ringRecv`, `ringSend`,
+`ringAccept`, `ringConnect`, `ringRead`, `ringWrite` (regular files too, which epoll cannot
+do). They return the kernel's result (a value >= 0 or `-errno`), take caller-owned buffers
+and, if the task is cancelled while waiting, resume only after the kernel has stopped using
+the buffer. Sockets used this way must be in blocking mode; `stagelane/net` handles that.
+
 ## 9. More than one thread
 
 ```
@@ -291,9 +353,57 @@ and plain ARC/ORC count references non-atomically. Programs that never create a
 pay nothing. With `atomicArc` the scheduler core runs at the same speed; only
 operations that really share objects (spawn + await, channels) cost up to ~1.5x more.
 
+**Where tasks go.** `newPool(n)` hands tasks to its workers in turn (cheapest: nothing is
+shared between spawning threads). When tasks differ a lot in how long they live (one task per
+connection, say), create the pool with `newPool(n, balLeastLoaded)`: every `go`/`spawn` then looks
+at two random workers and picks the one with fewer unfinished tasks, so a worker that is stuck
+behind a long task stops receiving new ones. `pool.load(i)` and `pool.leastLoaded()` (for
+`goAt`) expose the counts; they are only kept by least-loaded pools. Placement is decided
+when a task is started: a task never moves afterwards, and tasks already queued behind a
+long CPU-bound one are not stolen (see [internals](internals.md#placement)).
+
+`newPool(n, ring = true)` gives every worker its own io_uring (Linux 5.11+, see the server
+section above); sockets created by a task on such a worker are in ring mode.
+
 A task stays on the thread that took it. `Chan`, `Mutex` etc. belong to one thread;
 to move data between threads use `SharedChan[T]`. To use a blocking library, wrap
 the blocking call in a one-line flow proc and `pool.go` it (see [why.md](why.md)).
+
+## Flow procs as values
+
+A flow proc cannot go into a `proc` variable (calling it has to be known to possibly pause), but
+`flowFn(name)` makes a value that can be stored, passed and started later. Its type is
+`FlowFn[proc (params): Result]`; start it with `call` (inside a flow proc it may pause; anywhere
+else it blocks like calling the proc directly) or run it as a task with `go`, `scope.go`,
+`pool.go` or `pool.spawn`. Leading arguments can be *bound*:
+
+```nim
+import stagelane, std/tables
+
+proc greet(greeting, name: string): string {.flow.} =
+  delay(1)
+  greeting & ", " & name
+
+type Handler = FlowFn[proc (name: string): string]
+
+proc main() {.flow.} =
+  var routes = initTable[string, Handler]()
+  routes["en"] = flowFn(greet, "hello")      # binds `greeting`; `name` stays open
+  routes["de"] = flowFn(greet, "hallo")
+  echo routes["en"].call("world")            # may pause, like any flow call
+  let t = go routes["de"].call("welt")       # or run it as a task
+  echo await(t)
+
+run main()
+```
+
+What it is: the value holds the proc's *continuation constructor* plus its bound arguments, so
+starting it costs what starting the proc costs plus one indirect call. What it is not:
+a closure over your locals (a continuation owns its arguments by value, so bind values, not
+variables). Limits: up to 8 open parameters, no `var` parameters, the proc has to be named
+(a lambda marked `{.flow.}` is rejected) and declared at module level, like every flow proc;
+generic procs work once instantiated (`flowFn(f[int])`); default values of parameters must be
+passed explicitly to `call`.
 
 ## 10. Tips
 
@@ -321,8 +431,9 @@ the blocking call in a one-line flow proc and `pool.go` it (see [why.md](why.md)
   `items`, `pairs`, `mitems`, `mpairs` on seq/array/string are exact. Tuple
   destructuring `for (a, b) in ..` works everywhere, including `mitems` (the names alias
   the element's fields in place).
-* A flow proc cannot be stored in a `proc` variable yet.
-* `select` works on `Chan`, not `SharedChan`. Sockets are POSIX only.
+* A flow proc cannot be stored in a `proc` variable; use `flowFn` (see above). A flow proc
+  declared *inside* another proc is not supported (declare it at module level).
+* `select` works on `Chan`, not `SharedChan`. Sockets work on POSIX and Windows ([windows.md](windows.md)).
 * `scope` notices a failing child as soon as it fails (completion order) for children
   that run on the scheduler thread of the scope; children on other threads are waited
   for in spawn order.

@@ -14,32 +14,43 @@ import std/[macros, atomics, locks, deques, selectors]
 import ./core, ./transform, ./sched
 
 type
+  Balance* = enum
+    balLeastLoaded   ## power of two choices: look at two random workers, take the one with fewer live tasks
+    balRoundRobin    ## next worker in turn (per spawning thread)
   WorkerArg = object
     shared: ptr SchedShared
     ready: Atomic[bool]
+    ring: bool
   Pool* = ref object
     n*: int
+    balance*: Balance
     args: ptr UncheckedArray[WorkerArg]
     threads: ptr UncheckedArray[Thread[ptr WorkerArg]]
-    next: Atomic[int]
     stopped: bool
 
 proc workerMain(a: ptr WorkerArg) {.thread.} =
   {.cast(gcsafe).}:
     let s = sched()
+    when defined(linux):
+      if a.ring: discard ringEnable()      # this worker's own io_uring (falls back silently)
     a.shared = s.shared
     a.ready.store(true)
     runLoop(nil, forever = true)
     releaseSched(keepShared = true)   # `shutdown` frees it after the join
 
-proc newPool*(threads: int): Pool =
-  ## start `threads` worker threads
+proc newPool*(threads: int, balance = balRoundRobin, ring = false): Pool =
+  ## start `threads` worker threads.  `go`/`spawn` place a task with `balance`
+  ## (`goAt` names a worker explicitly).  The default, round robin, costs nothing per spawn;
+  ## `balLeastLoaded` keeps a live-task count per worker and avoids busy ones.  `ring = true`
+  ## gives every worker its own io_uring (Linux 5.11+; see `stagelane/uring`): tasks on that
+  ## worker then use the ring-based calls and sockets they create work in ring mode.
   doAssert threads > 0
-  result = Pool(n: threads)
+  result = Pool(n: threads, balance: balance)
   result.args = cast[ptr UncheckedArray[WorkerArg]](allocShared0(threads * sizeof(WorkerArg)))
   result.threads = cast[ptr UncheckedArray[Thread[ptr WorkerArg]]](
     allocShared0(threads * sizeof(Thread[ptr WorkerArg])))
   for i in 0..<threads:
+    result.args[i].ring = ring
     createThread(result.threads[i], workerMain, addr result.args[i])
   for i in 0..<threads:
     while not result.args[i].ready.load: osYield()
@@ -71,12 +82,56 @@ template throttle(ex: Pool) =
       burst = 0
       osYield()
 
+# --- placement ---------------------------------------------------------------------
+
+var rngState {.threadvar.}: uint64     # xorshift64, per spawning thread
+var rrNext {.threadvar.}: int          # round robin position, per spawning thread
+
+proc loadOf(sh: ptr SchedShared): int {.inline.} =
+  ## root tasks handed to this worker that have not finished (queued, running or parked)
+  sh.posted.load(moRelaxed) - atomicLoadN(addr sh.done, ATOMIC_RELAXED)
+
+proc pick(ex: Pool): int {.inline.} =
+  if ex.n == 1: return 0
+  case ex.balance
+  of balRoundRobin:
+    result = rrNext
+    if result >= ex.n: result = 0          # (the counter is shared by pools of different sizes)
+    rrNext = result + 1
+  of balLeastLoaded:
+    # one random draw gives both candidates (multiply-shift: no division)
+    var x = rngState
+    if x == 0:
+      x = uint64(nowNs()) xor (uint64(cast[uint](addr rngState)) shl 20) or 1'u64
+    x = x xor (x shl 13)
+    x = x xor (x shr 7)
+    x = x xor (x shl 17)
+    rngState = x
+    let a = int((uint64(uint32(x)) * uint64(ex.n)) shr 32)
+    var b = int((uint64(uint32(x shr 32)) * uint64(ex.n - 1)) shr 32)
+    if b >= a: inc b                        # a different worker, uniformly
+    result = if loadOf(ex.args[b].shared) < loadOf(ex.args[a].shared): b else: a
+
+proc load*(ex: Pool, worker: int): int =
+  ## number of tasks started through `go` / `spawn` on `worker` that have not finished
+  ## (only kept by a pool created with `balLeastLoaded`; 0 otherwise)
+  loadOf(ex.args[worker].shared)
+
+proc leastLoaded*(ex: Pool): int =
+  ## index of the worker with the fewest live tasks (to use with `goAt`; needs a pool
+  ## created with `balLeastLoaded`)
+  result = 0
+  var best = high(int)
+  for i in 0..<ex.n:
+    let l = loadOf(ex.args[i].shared)
+    if l < best: (best = l; result = i)
+
 proc goPoolImpl*[R](ex: Pool, idx: int, c: sink Frame, _: typedesc[R]): Task[R] =
   result = Task[R]()
   when R isnot void:
     c.dest = addr result.value
-  let i = if idx >= 0: idx mod ex.n else: ex.next.fetchAdd(1) mod ex.n
-  launchOn(c, result, ex.args[i].shared)
+  let i = if idx >= 0: idx mod ex.n else: pick(ex)
+  launchOn(c, result, ex.args[i].shared, ex.balance == balLeastLoaded)
   throttle(ex)
 
 macro go*(ex: Pool, call: typed): untyped =
@@ -93,8 +148,12 @@ proc spawnPoolImpl*(ex: Pool, idx: int, c: sink Frame) =
   ## fire-and-forget: no `Task` handle, no completion bookkeeping.  The frame runs
   ## on a worker and is freed when it finishes.  An exception that escapes it is
   ## not caught by anyone (like an unhandled exception in a thread).
-  let i = if idx >= 0: idx mod ex.n else: ex.next.fetchAdd(1) mod ex.n
-  post(ex.args[i].shared, pin(c))
+  let i = if idx >= 0: idx mod ex.n else: pick(ex)
+  let sh = ex.args[i].shared
+  if ex.balance == balLeastLoaded:
+    c.caller = sh.spawnSink          # its completion lowers the worker's load (see `spawnDoneStage`)
+    discard sh.posted.fetchAdd(1, moRelaxed)
+  post(sh, pin(c))
   throttle(ex)
 
 macro spawn*(ex: Pool, call: typed): untyped =

@@ -57,8 +57,8 @@ echo total(@["apple", "fig"])      # called from ordinary code: just works
 **What is honest to say:** the *declaration* is still marked (`{.flow.}`), so this is
 not magic colourlessness. What disappears is the marker at every call site, the
 "you must be inside an async proc" restriction, and the cost of procs that do not
-pause. Today a flow proc cannot be stored in a `proc` variable or be generic;
-those are on the list.
+pause. A flow proc cannot be stored in a plain `proc` variable, but `flowFn` makes a storable
+value of it (see the [guide](guide.md#flow-procs-as-values)); generic flow procs work too.
 
 ## How it compares
 
@@ -97,28 +97,30 @@ are total milliseconds), with the thread pools at 4 workers in the multi section
 
 | benchmark | stagelane | nimony .passive | go |
 |---|---|---|---|
-| call_10M (a call that can pause) | **9.9** | 16.8 | 1.5 (plain call, not comparable) |
-| yield_2M | **11.9** | 90.1 | 108.3 |
-| spawn_200k | **16.8** | 69.0 | 701.4 |
-| fanout_100k_x3yield | **21.0** | 47.5 | 471.0 |
-| pingpong_200k | **51.7** | 460.0 | 193.5 |
-| timers_100k | **27 ms** | 43 ms | 191 ms |
-| cpu_64x2M | 106 ms | 110 ms | **91 ms** |
-| chan_pipe_20000 | **21.9** | HANG | 67.8 |
-| chan_pipe_500000 | **39.0** | HANG | 47.9 |
-| multi: spawn_200k, `pool.go` + await | 239.3 | **69.2** | 469.2 |
-| multi: spawn_200k, `pool.spawn` + `Latch` | 84.0 | **69.8** | 495.1 |
+| call_10M (a call that can pause) | **10.1** | 14.5 | 1.5 (plain call, not comparable) |
+| yield_2M | **10.5** | 96.7 | 112.1 |
+| spawn_200k | **14.6** | 63.0 | 926.5 |
+| fanout_100k_x3yield | **23.8** | 52.0 | 617.6 |
+| pingpong_200k | **48.8** | 495.3 | 159.2 |
+| timers_100k | **33 ms** | 49 ms | 241 ms |
+| cpu_64x2M | **105 ms** | 116 ms | 111 ms |
+| chan_pipe_20000 | **19.1** | 186.2 | 47.9 |
+| chan_pipe_500000 | **23.5** | HANG | 46.4 |
+| multi: spawn_200k, `pool.go` + await | 190.5 | **64.8** | 579.8 |
+| multi: spawn_200k, `pool.spawn` + `Latch` | **67.1** | 70.3 | 621.2 |
 
 How to read this, honestly:
 
 * **Nimony's spawn is fire-and-forget; `pool.go` returns a handle.** Handle-based
   `pool.go` pays for a result slot and completion state, so Nimony is ahead in the
-  multi-worker spawn row (about 3.5x for `pool.go`, about 1.2x for the like-for-like
-  `pool.spawn`). That is the one row stagelane loses besides the two below.
+  multi-worker spawn row (about 3x for `pool.go`, down from 3.5x). The like-for-like
+  `pool.spawn` row is now level (67 vs 70 ns; within the noise of this VM). That is the
+  one row stagelane loses.
 * **cpu_64x2M measures the C compiler, not the runtime.** The loop is a plain loop in
   every language; plain Nim and stagelane compile it to the same time. Nimony and Go
   wrap on integer overflow, so the Nim build here uses `--overflowChecks:off` to do the
-  same (about 14% on this loop). Go still wins by a few percent.
+  same (about 14% on this loop). The three land within about 10% of each
+  other and the order changes from run to run.
 * **`call_10M`:** Go's number is an ordinary function call, which cannot pause, so it is
   shown for scale only.
 * **One CPU.** Multi-worker rows share a single core, so they show scheduling overhead,
@@ -177,3 +179,26 @@ run main()
   stagelane helps with *waiting*, not with arithmetic.
 * Hard real-time: tasks are cooperative; a task that never pauses starves others
   (call `checkpoint()` or `yieldNow()` in long loops).
+
+### Sockets: an HTTP hello server
+
+The scheduler numbers above are in-memory. A server spends its time in syscalls, so
+`bench/http/` drives real sockets (64 keep-alive connections, Go load generator on the same
+machine, 1 shared vCPU). The figure that matters is **server CPU per request**; requests per
+second here mostly measure the load generator. Nothing was tuned per server.
+
+| server | busy keep-alive | idle keep-alive (1 ms gaps) | one request per connection |
+|---|---|---|---|
+| stagelane before the I/O work (stock API) | 4.1 us | 4.6 us | 14.8 us |
+| stagelane, stock API | 2.4 us | 2.9 us | 14-17 us |
+| stagelane, `recvInto`/`sendFrom` | 2.6 us | 2.6 us | 13.3 us |
+| stagelane, io_uring | 2.3 us | 2.6 us | 13.3 us |
+| Go `net/http`, 1 proc | 10.2 us | 16.0 us | 29.3 us |
+
+Syscalls per idle keep-alive request, counted with `strace`: **5.03 before** (two
+`epoll_ctl`, two `recv` one of which says EAGAIN, one `send`, a share of `epoll_wait`),
+**2.04 now** (`recv`, `send`), **0.20 with io_uring** (one `io_uring_enter` serves several
+requests). Connection churn is dominated by `accept`/`connect`/`close` in the kernel and
+barely moves. The io_uring row is about equal on CPU because loopback TCP inside a VM is
+dominated by the kernel network stack; the saved syscalls matter more where entering the
+kernel is expensive (mitigations, sandboxes, many connections per loop turn).

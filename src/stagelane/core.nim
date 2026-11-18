@@ -22,7 +22,7 @@ when flowThreads:
 
 type
   TaskState* = enum tsPending, tsDone, tsFailed, tsCancelled
-  ParkKind* = enum pkNone, pkQueue, pkAny, pkTimer, pkFd
+  ParkKind* = enum pkNone, pkQueue, pkAny, pkTimer, pkFd, pkRing
 
   Hop* = object
     ## what to run next; `fn == nil` means "nothing: parked or finished"
@@ -62,20 +62,29 @@ type
   TaskBase* = ref object of Frame
     ## a task is itself the root continuation's parent: when the root finishes
     ## it resumes the task, whose stage publishes the outcome.
-    ## (small fields first: Nim keeps declaration order, so this avoids padding)
+    ## Kept small (it is allocated once per `go`): the five flag bytes share one word,
+    ## the exception of a failed task lives in the inherited `ex` slot (see `err`), and
+    ## what the task is parked on (queue, timer, fd, ...) shares one pointer.
     state*: TaskState
     cancelRequested*: bool
     parkKind*: ParkKind                ## what it waits on (for cancellation)
     parkWrite*: bool
     observed*: bool
-    parkFd*: int32
-    err*: ref Exception
+    counted*: bool                     ## launched through a pool: counts in its worker's load
     parked*: pointer                   ## continuation currently parked (alias, not an owner)
-    parkQ*: pointer                    ## the WaitQueue it is parked in (borrowed)
-    parkRef*: pointer                  ## Timer / AnyState it waits on (borrowed)
-    doneq*: WaitQueue                  ## continuations waiting for completion
+    parkRef*: pointer                  ## what it is parked on (borrowed): the WaitQueue
+                                       ## (pkQueue), Timer / AnyState / RingOp, or the fd (pkFd)
+    doneq*: WaitQueue                  ## continuations waiting for completion (created lazily,
+                                       ## published with a CAS: see `ensureDoneq`)
     sched*: pointer                    ## owning scheduler
     grp*: GroupBase                    ## the scope this task reports to (cleared on finish)
+
+template err*(t: TaskBase): ref Exception =
+  ## the exception a failed or cancelled task finished with
+  t.ex
+
+template `err=`*(t: TaskBase, e: ref Exception) =
+  t.ex = e
 
 const noStep* = Hop()
 
@@ -110,12 +119,17 @@ proc release*(p: pointer) {.inline.} =
   var c = unpin(p)
   discard c
 
+var sinkStage*: StageFn
+  ## stage of the shared "caller" of detached roots (see `spawn`): it is not owned by the
+  ## chain below it, so `releaseChain` stops in front of it
+
 proc releaseChain*(p: pointer) =
   ## drop a pin and the pins of all callers up to the root
   var q = p
   while q != nil:
-    let m = envOf(q).caller
+    var m = envOf(q).caller
     release(q)
+    if m != nil and sinkStage != nil and envOf(m).fn == sinkStage: m = nil
     q = m
 
 proc step*(p: pointer): Hop {.inline.} =
