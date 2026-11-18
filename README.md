@@ -52,5 +52,5 @@ run main()
 
 ## Status
 
-Version 0.1. Solid core, tested under sanitizers on Linux. Known gaps: no work stealing between pool workers,
+Version 0.3. Solid core, tested under sanitizers on Linux. Known gaps: no work stealing between pool workers,
 no nested or anonymous flow procs. See [limits](docs/guide.md#limits).
