@@ -16,10 +16,11 @@
 ##
 ## Sockets used with these calls must be in *blocking* mode (io_uring waits for you):
 ## `stagelane/net` does that automatically once the ring is enabled.
-import ./core, ./transform, ./sched
 
 when defined(linux):
-  import ./ringcore
+  # `Frame` and `{.flow.}` plus `ringAcquire` / `ringWait` / `ringRelease`.
+  # Inside `when` so macOS and Windows do not import them unused.
+  import ./core, ./transform, ./sched, ./ringcore
   export ringEnable, ringActive
 
   const
