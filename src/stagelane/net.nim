@@ -5,7 +5,9 @@ when defined(windows):
 else:
   import std/posix
 import std/macros
-import ./core, ./transform, ./sched, ./uring, ./flowfn
+import ./core, ./transform, ./sched, ./flowfn
+when defined(linux):
+  import ./uring                       # ringAccept / ringConnect / ringRecv / ringSend
 
 # --- the few socket calls that differ between Winsock and POSIX ---------------
 when defined(windows):
