@@ -1256,8 +1256,6 @@ when flowThreads:
     release(sh.spawnSink)
     deallocShared(sh.rawBase)
 
-const stagecoachSchedCleanup* = true
-
 proc releaseSched*(keepShared = false) =
   ## Free the calling thread's scheduler after all its tasks have stopped.
   ## With flowThreads and `keepShared`, the joiner must call `freeShared`.
