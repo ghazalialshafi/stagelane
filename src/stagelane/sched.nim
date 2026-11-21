@@ -1256,17 +1256,23 @@ when flowThreads:
     release(sh.spawnSink)
     deallocShared(sh.rawBase)
 
-  proc releaseSched*(keepShared = false) =
-    ## free the scheduler of the calling (worker) thread; called on thread exit.
-    ## With `keepShared` the mailbox/wake-up event stay allocated for the joiner
-    ## to `freeShared`.
-    drainPools()
-    if theSched == nil: return
+const stagecoachSchedCleanup* = true
+
+proc releaseSched*(keepShared = false) =
+  ## Free the calling thread's scheduler after all its tasks have stopped.
+  ## With flowThreads and `keepShared`, the joiner must call `freeShared`.
+  drainPools()
+  if theSched == nil: return
+  when flowThreads:
     let sh = theSched.shared
-    when defined(linux):
-      if theSched.ring != nil: theSched.ring.close()
-    if theSched.sel != nil: theSched.sel.close()
-    theSched = nil
+  when defined(linux):
+    if theSched.ring != nil: theSched.ring.close()
+  if theSched.sel != nil: theSched.sel.close()
+  when defined(linux):
+    if theSched.pepOn:
+      discard posix.close(theSched.pepFd)
+  theSched = nil
+  when flowThreads:
     if not keepShared: freeShared(sh)
 
 proc runUntilIdle*() = runLoop(nil)
